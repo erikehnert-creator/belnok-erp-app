@@ -2577,6 +2577,14 @@ phasenRechnerSetzen((k, stamm) => kalkulierePhasen(k, stamm));
 
 const BEDINGUNGEN = ['sofort', 'nach Kundenfreigabe', 'Option (auf Wunsch)'];
 
+/** Stufenangebot: Phasen „nach Kundenfreigabe“ haben einen eigenen Preis und werden erst mit der Freigabe beauftragt. */
+const stufenangebot = (k) => k?.stufenangebot === true;
+/** Bedingung für den Preis: ohne Stufenangebot zählt „nach Kundenfreigabe“ zum Auftragspreis (die Fertigung wartet nur). */
+function preisBedingung(k, ph) {
+  const b = ph?.bedingung ?? 'sofort';
+  return b === 'nach Kundenfreigabe' && !stufenangebot(k) ? 'sofort' : b;
+}
+
 /**
  * Wiederholteil ("schon mal gefertigt"): einmalige Phasen (Konstruktion, CAM-Programm,
  * Slicen, Prototyp) sind schon erledigt und kosten nichts mehr. Sie bleiben in der
@@ -2658,21 +2666,29 @@ function kalkulierePhasen(k, stamm) {
     const eingabe = weg ? { auftragsart: phase.auftragsart, menge: phase.menge, kostenart: phase.kostenart, schaetzqualitaet: 3 } : phase;
     return { phase: { bedingung: 'sofort', ...phase }, weg, r: kalkuliere({ ...eingabe, nr: `${k.nr}/${i + 1}` }, stamm) };
   });
-  const sofort = liste.filter((x) => x.phase.bedingung === 'sofort');
-  const optional = liste.filter((x) => x.phase.bedingung !== 'sofort');
+  // 0.26 (Erik 30.10.2026): „nach Kundenfreigabe“ heißt nur, die Fertigung wartet auf die Freigabe; der Preis
+  // gehört zum Auftrag. Getrennte Preise (Stufe 2 erst nach Freigabe beauftragt) nur beim Stufenangebot.
+  const preisBed = (ph) => preisBedingung(k, ph);
+  const sofort = liste.filter((x) => preisBed(x.phase) === 'sofort');
+  const optional = liste.filter((x) => preisBed(x.phase) !== 'sofort');
   const s = summe(sofort, p), o = summe(optional, p), g = summe(liste, p);
   const hinweise = liste.flatMap((x, i) => x.r.hinweise.map((h) => `Phase ${i + 1}: ${h}`));
   if (k.wiederholteil && !liste.some((x) => x.weg)) hinweise.push('Schon mal gefertigt, aber keine Phase ist „einmalig“: nichts fällt weg (Kostenart der Phasen prüfen)');
   if (sofort.length && s.zielpreis < p.minAuftragswert) hinweise.push('Sofort-Teil unter Mindestauftragswert');
-  if (optional.some((x) => x.phase.auftragsart === 'Fremdleistung (Weitergabe)' && !gesetzt(x.phase.fremdleistung))) {
+  if (liste.some((x) => x.phase.bedingung === 'nach Kundenfreigabe' && x.phase.auftragsart === 'Fremdleistung (Weitergabe)' && !gesetzt(x.phase.fremdleistung))) {
     hinweise.push('Fremdleistung ohne Einkaufspreis: Angebot des Zulieferers fehlt (Schätzung = gelb)');
+  }
+  // Reihenfolge: der Prototyp braucht das Slicen vorher (Rasterbahn 30.10.2026: Slicen stand auf „nach Kundenfreigabe“)
+  const bed = (art) => k.phasen.filter((ph) => ph.phasenart === art).map((ph) => ph.bedingung ?? 'sofort');
+  if (bed('Prototyp drucken').includes('sofort') && bed('Druck vorbereiten (Slicen)').length && !bed('Druck vorbereiten (Slicen)').includes('sofort')) {
+    hinweise.push('Slicen steht auf „nach Kundenfreigabe“, der Prototyp braucht es aber vorher: Slicen auf „sofort“ stellen');
   }
   // Nachlass (z. B. Freundschaftspreis) auf den Zielpreis von Teil 1; ein fester Angebotspreis hat Vorrang
   const nachlassPct = rabattProzent(k);
   const nachlass = nachlassPct > 0 ? cent(s.zielpreis * nachlassPct) : 0;
   const preisSofort = gesetzt(k.angebotspreisSofort) ? k.angebotspreisSofort : nachlass ? cent(s.zielpreis - nachlass) : '';
   if (nachlass && gesetzt(k.angebotspreisSofort)) hinweise.push('Nachlass nicht angewendet: fester Angebotspreis gesetzt');
-  const phasenErg = liste.map((x) => ({ ...x.r, menge: zahl(x.phase.menge, 1), bedingung: x.phase.bedingung }));
+  const phasenErg = liste.map((x) => ({ ...x.r, menge: zahl(x.phase.menge, 1), bedingung: preisBed(x.phase) }));
   const nfMenge = k.nachfertigungMenge || sofort.reduce((a, x) => Math.max(a, x.phase.kostenart === 'je Stück' ? zahl(x.phase.menge, 1) : 0), 0);
   const nfNeu = phasenIn.map((ph, i) => (ph.v === 2 && zahl(nfMenge) > 0
     ? kalkuliere({ ...ph, ...ableiten(k.phasen[i], { ...k, menge: zahl(nfMenge) }, stamm), nr: `${k.nr}/NF${i + 1}` }, stamm) : null));
@@ -2685,7 +2701,9 @@ function kalkulierePhasen(k, stamm) {
     kundenrabatt: zahl(k.kundenrabatt),
     nachlassProzent: nachlassPct, nachlass, preisSofort: gesetzt(preisSofort) ? zahl(preisSofort) : null,
     nachfertigung: nf,
-    phasen: liste.map((x, i) => ({ nr: i + 1, name: x.phase.name ?? `Phase ${i + 1}`, bedingung: x.phase.bedingung,
+    stufenangebot: stufenangebot(k),
+    phasen: liste.map((x, i) => ({ nr: i + 1, name: x.phase.name ?? `Phase ${i + 1}`, bedingung: preisBed(x.phase), freigabe: x.phase.bedingung === 'nach Kundenfreigabe',
+      phasenart: x.phase.phasenart ?? '',
       auftragsart: x.phase.auftragsart, menge: zahl(x.phase.menge, 1), ...x.r, kalkNr: x.r.nr, nr: i + 1, entfaellt: x.weg })),
     sofort: { ...s, ...bewerteAngebot(preisSofort, s) },
     optional: optional.length ? { ...o, ...bewerteAngebot(k.angebotspreisOptional, o) } : null,
@@ -2694,7 +2712,7 @@ function kalkulierePhasen(k, stamm) {
   };
 }
 
-return { BEDINGUNGEN, rabattProzent, entfaellt, MENGENFELDER, mengeUmrechnen, nachfertigung, kalkulierePhasen };
+return { BEDINGUNGEN, stufenangebot, preisBedingung, rabattProzent, entfaellt, MENGENFELDER, mengeUmrechnen, nachfertigung, kalkulierePhasen };
 })();
 
 // ---- src/staende.js
@@ -2811,6 +2829,120 @@ function vergleicheStaende(alt, neu) {
 return { preisStamm, einfrieren, letzterStand, kalkFuerAuftrag, standPruefen, stammVerlaufErgaenzen, stammAm, vergleicheStaende };
 })();
 
+// ---- src/pdf.js
+const __m_pdf_26 = (() => {
+// Kleiner PDF-Schreiber ohne Fremdbibliothek (0.26): A4, Helvetica normal/fett (WinAnsi, also auch
+// Umlaute, ß und €), Text, Linien, Rechtecke, Pfade. Koordinaten in mm von links oben.
+// Reicht für Angebot und Rechnung; die PDF-Datei wird im Browser erzeugt und in der Ablage gespeichert.
+
+const BREITE_N = [278,278,355,556,556,889,667,191,333,333,389,584,278,333,278,278,556,556,556,556,556,556,556,556,556,556,278,278,584,584,584,556,1015,667,667,722,722,667,611,778,722,278,500,667,556,833,722,778,667,778,722,667,611,722,667,944,667,667,611,278,278,278,469,556,333,556,556,500,556,556,278,556,556,222,222,500,222,833,556,556,556,556,333,500,278,556,500,722,500,500,500,334,260,334,584,0,556,0,222,556,333,1000,556,556,333,1000,667,333,1000,0,611,0,0,222,222,333,333,350,556,1000,333,1000,500,333,944,0,500,500,278,333,556,556,556,556,260,556,333,737,370,556,584,333,737,333,400,584,333,333,333,556,537,278,333,333,365,556,834,834,834,611,667,667,667,667,667,667,1000,722,667,667,667,667,278,278,278,278,722,722,778,778,778,778,778,584,778,722,722,722,722,667,667,611,556,556,556,556,556,556,889,500,556,556,556,556,278,278,278,278,556,556,556,556,556,556,556,584,611,556,556,556,556,500,556,0];
+const BREITE_F = [278,333,474,556,556,889,722,238,333,333,389,584,278,333,278,278,556,556,556,556,556,556,556,556,556,556,333,333,584,584,584,611,975,722,722,722,722,667,611,778,722,278,556,722,611,833,722,778,667,778,722,667,611,722,667,944,667,667,611,333,278,333,584,556,333,556,611,556,611,556,333,611,611,278,278,556,278,889,611,611,611,611,389,556,333,611,556,778,556,556,500,389,280,389,584,0,556,0,278,556,500,1000,556,556,333,1000,667,333,1000,0,611,0,0,278,278,500,500,350,556,1000,333,1000,556,333,944,0,500,556,278,333,556,556,556,556,280,556,333,737,370,556,584,333,737,333,400,584,333,333,333,611,556,278,333,333,365,556,834,834,834,611,722,722,722,722,722,722,1000,722,667,667,667,667,278,278,278,278,722,722,778,778,778,778,778,584,778,722,722,722,722,667,667,611,556,556,556,556,556,556,889,556,556,556,556,556,278,278,278,278,611,611,611,611,611,611,611,584,611,611,611,611,611,556,611,0];
+const WIN_80 = [8364,0,8218,402,8222,8230,8224,8225,710,8240,352,8249,338,0,381,0,0,8216,8217,8220,8221,8226,8211,8212,732,8482,353,8250,339,0,382,376];
+
+const MM = 72 / 25.4;
+const B = 210, H = 297;
+
+/** Unicode -> WinAnsi-Byte (unbekannt = ?). */
+function winAnsi(ch) {
+  const c = ch.codePointAt(0);
+  if ((c >= 32 && c <= 126) || (c >= 160 && c <= 255)) return c;
+  const i = WIN_80.indexOf(c);
+  if (i >= 0 && c) return 128 + i;
+  if (c === 0x2212) return 45; // Minuszeichen
+  if (c === 0x2192) return 62; // Pfeil
+  if (c === 0x2009 || c === 0x202f) return 32;
+  return 63;
+}
+
+/** Textbreite in mm. */
+function textBreite(text, groesse = 10, fett = false) {
+  const tab = fett ? BREITE_F : BREITE_N;
+  let w = 0;
+  for (const ch of String(text)) { const b = winAnsi(ch); w += tab[b - 32] ?? 556; }
+  return (w / 1000) * groesse / MM;
+}
+
+/** Text in Zeilen umbrechen, die höchstens `breite` mm breit sind. */
+function umbrechen(text, breite, groesse = 10, fett = false) {
+  const zeilen = [];
+  for (const absatz of String(text ?? '').split('\n')) {
+    let z = '';
+    for (const wort of absatz.split(/\s+/).filter(Boolean)) {
+      const t = z ? `${z} ${wort}` : wort;
+      if (z && textBreite(t, groesse, fett) > breite) { zeilen.push(z); z = wort; } else z = t;
+    }
+    zeilen.push(z);
+  }
+  return zeilen;
+}
+
+const zahl = (n) => (Math.round(n * 100) / 100).toString();
+const farbe = (hex) => { const m = /^#?(..)(..)(..)$/.exec(hex ?? '#000000'); return m.slice(1).map((x) => zahl(parseInt(x, 16) / 255)).join(' '); };
+const esc = (bytes) => bytes.map((b) => (b === 40 || b === 41 || b === 92 ? `\\${String.fromCharCode(b)}` : String.fromCharCode(b))).join('');
+
+function pdfDokument({ titel = '', autor = '' } = {}) {
+  const seiten = [];
+  let s = null;
+  const doc = {
+    seitenzahl: () => seiten.length,
+    seite() { s = []; seiten.push(s); return doc; },
+    text(x, y, text, { groesse = 10, fett = false, farbe: f = '#1F2328', rechts = false } = {}) {
+      const t = String(text ?? '');
+      const xx = rechts ? x - textBreite(t, groesse, fett) : x;
+      const bytes = [...t].map(winAnsi);
+      s.push(`BT /${fett ? 'F2' : 'F1'} ${zahl(groesse)} Tf ${farbe(f)} rg ${zahl(xx * MM)} ${zahl((H - y) * MM)} Td (${esc(bytes)}) Tj ET`);
+      return doc;
+    },
+    linie(x1, y1, x2, y2, { farbe: f = '#d9dbd6', staerke = 0.3 } = {}) {
+      s.push(`${farbe(f)} RG ${zahl(staerke * MM)} w ${zahl(x1 * MM)} ${zahl((H - y1) * MM)} m ${zahl(x2 * MM)} ${zahl((H - y2) * MM)} l S`);
+      return doc;
+    },
+    rechteck(x, y, b, h, { rand = '#A86A3D', staerke = 0.5 } = {}) {
+      s.push(`${farbe(rand)} RG ${zahl(staerke * MM)} w ${zahl(x * MM)} ${zahl((H - y - h) * MM)} ${zahl(b * MM)} ${zahl(h * MM)} re S`);
+      return doc;
+    },
+    /** SVG-Pfad aus M/L/Z (absolut) gefüllt zeichnen, links oben bei x/y, `massstab` mm je Einheit. */
+    svgPfad(d, x, y, massstab, { farbe: f = '#1F4E79' } = {}) {
+      const teile = [];
+      for (const [, c, a, b] of String(d).matchAll(/([MLZ])\s*(?:(-?[\d.]+)[ ,](-?[\d.]+))?/g)) {
+        if (c === 'Z') teile.push('h');
+        else teile.push(`${zahl((x + Number(a) * massstab) * MM)} ${zahl((H - y - Number(b) * massstab) * MM)} ${c === 'M' ? 'm' : 'l'}`);
+      }
+      s.push(`${farbe(f)} rg ${teile.join(' ')} f*`);
+      return doc;
+    },
+    /** fertige PDF-Datei als Uint8Array */
+    bytes() {
+      const obj = [];
+      const add = (inhalt) => { obj.push(inhalt); return obj.length; };
+      const katalog = add(null), seitenObj = add(null);
+      const f1 = add('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>');
+      const f2 = add('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>');
+      const kids = seiten.map((inhalt) => {
+        const strom = inhalt.join('\n');
+        const c = add(`<< /Length ${strom.length} >>\nstream\n${strom}\nendstream`);
+        return add(`<< /Type /Page /Parent ${seitenObj} 0 R /MediaBox [0 0 ${zahl(B * MM)} ${zahl(H * MM)}] /Resources << /Font << /F1 ${f1} 0 R /F2 ${f2} 0 R >> >> /Contents ${c} 0 R >>`);
+      });
+      obj[katalog - 1] = `<< /Type /Catalog /Pages ${seitenObj} 0 R >>`;
+      obj[seitenObj - 1] = `<< /Type /Pages /Kids [${kids.map((k) => `${k} 0 R`).join(' ')}] /Count ${kids.length} >>`;
+      const info = add(`<< /Title (${esc([...titel].map(winAnsi))}) /Author (${esc([...autor].map(winAnsi))}) /Producer (BELNOK ERP) >>`);
+      let out = '%PDF-1.4\n%\xE2\xE3\xCF\xD3\n';
+      const offs = [];
+      obj.forEach((o, i) => { offs.push(out.length); out += `${i + 1} 0 obj\n${o}\nendobj\n`; });
+      const xref = out.length;
+      out += `xref\n0 ${obj.length + 1}\n0000000000 65535 f \n${offs.map((o) => `${String(o).padStart(10, '0')} 00000 n \n`).join('')}`;
+      out += `trailer\n<< /Size ${obj.length + 1} /Root ${katalog} 0 R /Info ${info} 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+      const u = new Uint8Array(out.length);
+      for (let i = 0; i < out.length; i++) u[i] = out.charCodeAt(i) & 0xff;
+      return u;
+    },
+  };
+  return doc;
+}
+
+return { textBreite, umbrechen, pdfDokument };
+})();
+
 // ---- src/angebot.js
 const __m_angebot_25 = (() => {
 // Angebotsentwurf als druckbares HTML (Drucken -> "Als PDF speichern").
@@ -2819,9 +2951,10 @@ const __m_angebot_25 = (() => {
 // Solange Gewerbeanmeldung und Umsatzsteuer-Modus offen sind, trägt jedes
 // Angebot den Vermerk ENTWURF und einen Platzhalter für den Steuerhinweis.
 
-const { kalkulierePhasen, rabattProzent } = __m_phasen_21;
+const { kalkulierePhasen, rabattProzent, stufenangebot } = __m_phasen_21;
 const { preisPosition } = __m_kalkulation_1;
 const { cent, zahl, gesetzt } = __m_runden_2;
+const { pdfDokument, umbrechen } = __m_pdf_26;
 
 const BILDMARKE = '<svg viewBox="0 0 38.246 50" width="34" height="44" aria-hidden="true"><path fill="#1F4E79" fill-rule="evenodd" d="M20.703,34.543 L13.147,30.181 L0,37.772 L0,46.496 Z M17.466,13.639 L0,23.723 L0,32.965 L17.466,22.881 Z M17.784,0 L0,10.268 L0,19.214 L17.148,9.313 L30.724,17.151 L20.824,22.867 L20.824,27.933 L29.566,32.98 L8.067,45.392 L16.048,50 L38.246,37.184 L38.246,28.521 L32.2,25.03 L38.246,21.54 L38.246,11.814 Z"/></svg>';
 
@@ -2860,25 +2993,146 @@ function nachlassZeile(k, summeSofort) {
   return { text: teile.join(' + ') || `Rabatt ${p(pct)}`, betrag: -cent(summeSofort * pct) };
 }
 
-function angebotHtml(k, { stamm, firma = {}, kunde = {}, nr, version = 1, datum, gueltigBis, termin = '',
-  ustModus = 'offen', hinweise = [] }) {
-  const pos = angebotsPositionen(k, stamm);
-  const nfr = k.nachfertigungImAngebot ? kalkulierePhasen(k, stamm).nachfertigung : null;
-  const block = (liste) => liste.map((p) => `<tr><td>${p.nr}</td><td><strong>${esc(p.text)}</strong>` +
-    `${p.beschreibung ? `<br><span class="leise">${esc(p.beschreibung)}</span>` : ''}` +
-    `${p.pauschal ? `<br><span class="leise">${p.stueckzahl} Stück, pauschal</span>` : ''}</td>` +
-    `<td class="z">${p.menge}</td>${p.offen ? '<td class="z" colspan="2">Preis folgt nach Angebot des Fertigungspartners</td>'
-      : `<td class="z">${eur(p.einzel)}</td><td class="z">${eur(p.gesamt)}</td>`}</tr>`).join('');
-  const sofort = pos.filter((p) => p.bedingung === 'sofort');
-  const optional = pos.filter((p) => p.bedingung === 'nach Kundenfreigabe');
-  const optionen = pos.filter((p) => p.bedingung === 'Option (auf Wunsch)');
-  const summe = (l) => cent(l.reduce((a, p) => a + p.gesamt, 0));
-  const entwurf = ustModus === 'offen';
-  const nl = nachlassZeile(k, summe(sofort));
-  const summeSofort = nl ? cent(summe(sofort) + nl.betrag) : summe(sofort);
-  const f = { name: 'BELNOK', inhaber: 'Erik Ehnert', anschrift: '[Anschrift]', kontakt: '[E-Mail · Telefon]', ...firma };
+// ---------------------------------------------------------------- Angebotszeilen (0.26)
+//
+// Erik 30.10.2026: Kein Arbeitsschritt mit Preis im Angebot (Sägen, Fräsen, Slicen sind Kalkulation).
+// Üblich in der Lohnfertigung: das Teil mit Stückpreis, daneben die Einmalkosten (Konstruktion,
+// Prototyp, Programmierung), Lieferung extra und darunter der Preis für eine Nachbestellung.
 
-  return `<!doctype html><html lang="de"><head><meta charset="utf-8"><title>Angebot ${esc(nr)}</title>
+const EINMAL_GRUPPEN = [
+  { gruppe: 'Konstruktion', arten: ['Reverse Engineering (Scan + CAD)', 'CAD-Konstruktion', 'CAD-Modell anpassen'] },
+  { gruppe: 'Prototyp', arten: ['Prototyp drucken'] },
+  { gruppe: 'Programmierung', arten: ['CNC-Programm (CAM)', 'Druck vorbereiten (Slicen)', 'Vorrichtung bauen'] },
+];
+const LIEFER_ARTEN = ['Lieferung (Fahrt)', 'Verpackung und Versand'];
+
+function einmalText(gruppe, arten) {
+  if (gruppe === 'Konstruktion') {
+    if (arten.length === 1 && arten[0] === 'Reverse Engineering (Scan + CAD)') return 'Konstruktion nach Muster (3D-Scan und CAD-Modell)';
+    if (arten.length === 1 && arten[0] === 'CAD-Modell anpassen') return 'Anpassung des CAD-Modells';
+    return arten.includes('Reverse Engineering (Scan + CAD)') ? 'Konstruktion nach Muster (3D-Scan und CAD-Modell)' : 'Konstruktion (CAD-Modell)';
+  }
+  if (gruppe === 'Prototyp') return 'Prototyp zur Prüfung von Form und Passung';
+  return arten.includes('Vorrichtung bauen') ? 'Fertigungsvorbereitung (Programmierung und Vorrichtung)' : 'Fertigungsvorbereitung (Programmierung)';
+}
+
+/** Bezeichnung des Teils für Angebot und Rechnung. */
+const teilText = (k) => [k.teilNr, k.teilNr && k.teil?.startsWith(k.teilNr) ? k.teil.slice(k.teilNr.length).trim() : k.teil].filter(Boolean).join(' ') || 'Teil';
+
+/**
+ * Zeilen für Angebot und Rechnung aus den Phasen: Einmalkosten je Gruppe, das Teil (alle Stück- und
+ * Los-Phasen) mit Stückpreis, Lieferung, Optionen. Summen bleiben gleich den Phasen.
+ * @returns {{gruppe: 'einmal'|'teil'|'lieferung'|'option', bedingung: string, text: string, beschreibung: string,
+ *   menge: number, einheit: string, einzel: number, gesamt: number, offen: boolean, phasen: number[], lexwareNr: string}[]}
+ */
+function angebotsZeilen(k, stamm) {
+  const pos = angebotsPositionen(k, stamm);
+  const ph = (p) => k.phasen[p.nr - 1] ?? {};
+  const zeilen = [];
+  for (const bed of ['sofort', 'nach Kundenfreigabe', 'Option (auf Wunsch)']) {
+    const hier = pos.filter((p) => p.bedingung === bed);
+    if (!hier.length) continue;
+    // Optionen und Phasen ohne Phasenart (alte Kalkulationen vor 0.18) stehen einzeln wie bisher
+    const einzeln = (p, gruppe) => zeilen.push({ gruppe, bedingung: bed, text: p.text, beschreibung: p.beschreibung, menge: p.menge, einheit: p.pauschal ? 'pauschal' : 'Stk',
+      einzel: p.einzel, gesamt: p.gesamt, offen: p.offen, phasen: [p.nr], lexwareNr: ph(p).lexwareNr ?? '' });
+    if (bed !== 'Option (auf Wunsch)' && hier.every((p) => !ph(p).phasenart)) { hier.forEach((p) => einzeln(p, 'teil')); continue; }
+    if (bed === 'Option (auf Wunsch)') { hier.forEach((p) => einzeln(p, 'option')); continue; }
+    const einmal = hier.filter((p) => ph(p).kostenart === 'einmalig');
+    const liefer = hier.filter((p) => ph(p).kostenart !== 'einmalig' && LIEFER_ARTEN.includes(ph(p).phasenart));
+    const teil = hier.filter((p) => !einmal.includes(p) && !liefer.includes(p));
+    const pauschal = (liste, text, gruppe) => {
+      const beschr = liste.map((p) => p.beschreibung).filter(Boolean).join(' ');
+      const offen = liste.some((p) => p.offen);
+      const gesamt = cent(liste.reduce((a, p) => a + p.gesamt, 0));
+      zeilen.push({ gruppe, bedingung: bed, text, beschreibung: beschr, menge: 1, einheit: 'pauschal', einzel: gesamt, gesamt, offen,
+        phasen: liste.map((p) => p.nr), lexwareNr: liste.length === 1 ? ph(liste[0]).lexwareNr ?? '' : '' });
+    };
+    // Einmalkosten: bekannte Gruppen zusammengefasst, sonstige einmalige Phasen mit ihrem Namen
+    const rest = [...einmal];
+    for (const g of EINMAL_GRUPPEN) {
+      const l = einmal.filter((p) => g.arten.includes(ph(p).phasenart));
+      if (!l.length) continue;
+      l.forEach((p) => rest.splice(rest.indexOf(p), 1));
+      pauschal(l, einmalText(g.gruppe, l.map((p) => ph(p).phasenart)), 'einmal');
+    }
+    for (const p of rest) pauschal([p], p.text, 'einmal');
+    if (teil.length) {
+      const n = Math.max(1, zahl(k.menge) || Math.max(...teil.map((p) => zahl(p.stueckzahl, 1))));
+      const summe = cent(teil.reduce((a, p) => a + p.gesamt, 0));
+      const einzel = cent(summe / n);
+      const werkstoff = teil.map((p) => ph(p).material).find(Boolean);
+      const beschr = [werkstoff ? `Werkstoff ${werkstoff}` : '', ...teil.map((p) => p.beschreibung).filter(Boolean)].filter(Boolean).join(' · ');
+      zeilen.push({ gruppe: 'teil', bedingung: bed, text: teilText(k), beschreibung: beschr, menge: n, einheit: 'Stk', einzel, gesamt: cent(einzel * n),
+        offen: teil.some((p) => p.offen), phasen: teil.map((p) => p.nr), lexwareNr: k.lexwareNr ?? '' });
+    }
+    for (const p of liefer) pauschal([p], ph(p).phasenart === 'Lieferung (Fahrt)' ? 'Lieferung' : p.text, 'lieferung');
+  }
+  return zeilen;
+}
+
+const fremd = (k) => (k.phasen ?? []).some((p) => p.auftragsart === 'Fremdleistung (Weitergabe)');
+const wartetAufFreigabe = (k) => (k.phasen ?? []).some((p) => p.bedingung === 'nach Kundenfreigabe');
+
+/**
+ * Inhalt des Angebots, gemeinsam für HTML und PDF.
+ * @param {object} k  Kalkulation mit `phasen`
+ * @param {object} opt  { stamm, firma, kunde, nr, version, datum, gueltigBis, termin, ustModus, hinweise[] }
+ */
+function angebotDaten(k, { stamm, firma = {}, kunde = {}, nr, version = 1, datum, gueltigBis, termin = '', ustModus = 'offen', hinweise = [] }) {
+  const zeilen = angebotsZeilen(k, stamm);
+  const stufen = stufenangebot(k);
+  const r = kalkulierePhasen(k, stamm);
+  const summe = (l) => cent(l.reduce((a, z) => a + z.gesamt, 0));
+  const f = { name: 'BELNOK', inhaber: 'Erik Ehnert', anschrift: '[Anschrift]', kontakt: '[E-Mail · Telefon]', ...firma };
+  let pos = 0;
+  const nummern = (l) => l.map((z) => ({ ...z, pos: ++pos }));
+  const abschnitt = (bed, titel, hinweis) => {
+    const l = zeilen.filter((z) => z.bedingung === bed);
+    if (!l.length) return null;
+    const einmal = nummern(l.filter((z) => z.gruppe === 'einmal'));
+    const teile = nummern(l.filter((z) => z.gruppe !== 'einmal'));
+    const nl = bed === 'sofort' ? nachlassZeile(k, summe(l)) : null;
+    return { titel, hinweis, gruppen: [
+      einmal.length ? { titel: 'Einmalkosten (nur beim ersten Auftrag)', zeilen: einmal } : null,
+      teile.length ? { titel: !einmal.length ? '' : teile.every((z) => z.gruppe === 'lieferung') ? 'Lieferung'
+        : teile.some((z) => z.gruppe === 'lieferung') ? 'Teile und Lieferung' : 'Teile', zeilen: teile } : null].filter(Boolean),
+    zwischensumme: nl ? summe(l) : null, nachlass: nl,
+    summeText: bed === 'sofort' ? (stufen ? 'Summe Stufe 1 netto' : 'Gesamtpreis netto') : 'Summe Stufe 2 netto',
+    summe: l.some((z) => z.offen) ? null : cent(summe(l) + (nl?.betrag ?? 0)), offen: l.some((z) => z.offen) };
+  };
+  // Nachbestellpreis: Standard an, sobald es Einmalkosten gibt (abwählbar in der Kalkulation)
+  const hatEinmal = (k.phasen ?? []).some((p) => p.kostenart === 'einmalig');
+  const nf = (k.nachfertigungImAngebot ?? hatEinmal) ? r.nachfertigung : null;
+  const ablauf = !stufen && wartetAufFreigabe(k)
+    ? 'Ablauf: Zuerst entsteht der Prototyp. Sie prüfen ihn und geben ihn frei; erst danach beginnt die Fertigung der Teile.' : '';
+  return {
+    firma: f, kunde, nr, version, datum: datumDe(datum), gueltigBis: datumDe(gueltigBis), termin,
+    entwurf: ustModus === 'offen' ? UST_MODI.offen : '', ustText: ustModus === 'offen' ? '' : (UST_MODI[ustModus] ?? ''),
+    abschnitte: [
+      abschnitt('sofort', stufen ? 'Stufe 1 – Prototyp' : 'Leistungen', ''),
+      abschnitt('nach Kundenfreigabe', 'Stufe 2 – nach Ihrer Freigabe', `Wird erst nach Ihrer schriftlichen Freigabe des Prototyps beauftragt.${fremd(k) ? ' Preis und Liefertermin vorbehaltlich der Bestätigung durch den Fertigungspartner.' : ''}`),
+      abschnitt('Option (auf Wunsch)', 'Optionen (auf Wunsch zusätzlich)', 'Nicht im Preis oben enthalten. Bitte bei der Bestellung angeben, welche Optionen Sie möchten.'),
+    ].filter(Boolean),
+    nachbestellung: nf ? `Nachbestellung ohne Einmalkosten: ${eur(nf.zielpreisStueck)} je Stück bei ${nf.menge} Stück (Konstruktion und Programmierung liegen dann vor; Material zum Tagespreis).` : '',
+    ablauf,
+    hinweise,
+  };
+}
+
+function angebotHtml(k, opt) {
+  const d = angebotDaten(k, opt);
+  const f = d.firma;
+  const zeile = (z) => `<tr><td>${z.pos}</td><td><strong>${esc(z.text)}</strong>${z.beschreibung ? `<br><span class="leise">${esc(z.beschreibung)}</span>` : ''}</td>` +
+    `<td class="z">${z.einheit === 'pauschal' ? 'pauschal' : `${z.menge} Stk`}</td>${z.offen ? `<td class="z" colspan="2">Preis folgt${fremd(k) ? ' nach Angebot des Fertigungspartners' : ''}</td>`
+      : `<td class="z">${z.einheit === 'pauschal' ? '' : eur(z.einzel)}</td><td class="z">${eur(z.gesamt)}</td>`}</tr>`;
+  const tabelle = (a) => `<h2>${esc(a.titel)}</h2>${a.hinweis ? `<p class="leise">${esc(a.hinweis)}</p>` : ''}
+<table><thead><tr><th>Pos.</th><th>Leistung</th><th class="z">Menge</th><th class="z">Einzelpreis</th><th class="z">Gesamt</th></tr></thead><tbody>
+${a.gruppen.map((g) => `${g.titel ? `<tr class="gruppe"><td></td><td colspan="4">${esc(g.titel)}</td></tr>` : ''}${g.zeilen.map(zeile).join('')}`).join('')}
+${a.nachlass ? `<tr><td></td><td>Zwischensumme</td><td></td><td></td><td class="z">${eur(a.zwischensumme)}</td></tr><tr><td></td><td>${esc(a.nachlass.text)}</td><td></td><td></td><td class="z">${eur(a.nachlass.betrag)}</td></tr>` : ''}
+${a.titel.startsWith('Optionen') ? '' : `<tr class="summe"><td></td><td>${esc(a.summeText)}</td><td></td><td></td><td class="z">${a.offen ? 'folgt' : eur(a.summe)}</td></tr>`}
+</tbody></table>`;
+
+  return `<!doctype html><html lang="de"><head><meta charset="utf-8"><title>Angebot ${esc(d.nr)}</title>
 <style>
 @page { size: A4; margin: 18mm 18mm 20mm; }
 body { font: 10.5pt/1.45 "Segoe UI", system-ui, sans-serif; color: #1F2328; margin: 0; }
@@ -2889,6 +3143,7 @@ body { font: 10.5pt/1.45 "Segoe UI", system-ui, sans-serif; color: #1F2328; marg
 h1 { font-size: 15pt; color: #1F4E79; margin: 0 0 4px; } .meta { color: #5b6168; margin-bottom: 14px; }
 table { width: 100%; border-collapse: collapse; margin: 6px 0 4px; } th { text-align: left; font-size: 9pt; color: #5b6168; border-bottom: 1px solid #1F2328; padding: 4px; }
 td { border-bottom: 1px solid #d9dbd6; padding: 6px 4px; vertical-align: top; } td.z, th.z { text-align: right; white-space: nowrap; }
+tr.gruppe td { font-size: 9pt; color: #1F4E79; font-weight: 700; border-bottom: none; padding-top: 10px; }
 .summe td { border: none; font-weight: 700; } .leise { color: #5b6168; font-size: 9pt; }
 h2 { font-size: 11pt; margin: 18px 0 2px; color: #1F4E79; }
 .entwurf { border: 2px solid #A86A3D; color: #A86A3D; padding: 6px 10px; font-weight: 700; margin: 10px 0; }
@@ -2896,39 +3151,141 @@ ul { padding-left: 18px; } footer { margin-top: 24px; font-size: 8.5pt; color: #
 </style></head><body>
 <div class="kopf"><div class="marke">${BILDMARKE}<span class="wort">BELNOK</span></div>
 <div class="absender">${esc(f.inhaber)}<br>${esc(f.anschrift)}<br>${esc(f.kontakt)}</div></div>
-<div class="adresse"><span class="zeile">${esc(f.name)} · ${esc(f.anschrift)}</span><br>${esc(kunde.name ?? '[Kunde]')}<br>${esc(kunde.ansprechpartner ?? '')}${kunde.ansprechpartner ? '<br>' : ''}${esc(kunde.anschrift ?? '')}</div>
-<h1>Angebot ${esc(nr)}${version > 1 ? ` · Version ${version}` : ''}</h1>
-<div class="meta">Datum ${datumDe(datum)} · gültig bis ${datumDe(gueltigBis)}${termin ? ` · voraussichtlicher Termin: ${esc(termin)}` : ''}</div>
-${entwurf ? `<div class="entwurf">${UST_MODI.offen}</div>` : ''}
-${sofort.length ? `<h2>Leistungen${optional.length || optionen.length ? ' – sofort' : ''}</h2>
-<table><thead><tr><th>Pos.</th><th>Leistung</th><th class="z">Menge</th><th class="z">Einzelpreis</th><th class="z">Gesamt</th></tr></thead>
-<tbody>${block(sofort)}${nl ? `<tr><td></td><td>Zwischensumme</td><td></td><td></td><td class="z">${eur(summe(sofort))}</td></tr><tr><td></td><td>${esc(nl.text)}</td><td></td><td></td><td class="z">${eur(nl.betrag)}</td></tr>` : ''}<tr class="summe"><td></td><td>Summe${optional.length ? ' sofort' : ''} netto</td><td></td><td></td><td class="z">${sofort.some((p) => p.offen) ? 'unvollständig' : eur(summeSofort)}</td></tr></tbody></table>` : ''}
-${nfr ? `<p class="leise"><strong>Weitere Teile später:</strong> Nachfertigung nach demselben Programm ca. ${eur(nfr.zielpreisStueck)} je Stück bei ${nfr.menge} Stück (ohne erneute Konstruktion und Programmierung; Material zum Tagespreis).</p>` : ''}
-${optional.length ? `<h2>Nach Ihrer Freigabe (optional)</h2>
-<p class="leise">Wird nur nach Ihrer schriftlichen Freigabe beauftragt. Preis und Liefertermin gelten vorbehaltlich der Bestätigung durch den Fertigungspartner.</p>
-<table><thead><tr><th>Pos.</th><th>Leistung</th><th class="z">Menge</th><th class="z">Einzelpreis</th><th class="z">Gesamt</th></tr></thead>
-<tbody>${block(optional)}<tr class="summe"><td></td><td>Summe nach Freigabe netto</td><td></td><td></td><td class="z">${optional.some((p) => p.offen) ? 'folgt' : eur(summe(optional))}</td></tr></tbody></table>` : ''}
-${optionen.length ? `<h2>Optionen (auf Wunsch zusätzlich)</h2>
-<p class="leise">Nicht im Preis oben enthalten. Bitte bei der Bestellung angeben, welche Optionen Sie möchten.</p>
-<table><thead><tr><th>Pos.</th><th>Option</th><th class="z">Menge</th><th class="z">Einzelpreis</th><th class="z">Gesamt</th></tr></thead>
-<tbody>${block(optionen)}</tbody></table>` : ''}
-<p>${entwurf ? '' : esc(UST_MODI[ustModus] ?? '')}</p>
-${hinweise.length ? `<h2>Annahmen und Hinweise</h2><ul>${hinweise.map((h) => `<li>${esc(h)}</li>`).join('')}</ul>` : ''}
-<footer>${esc(f.name)} · ${esc(f.inhaber)} · Angebot ${esc(nr)} · Seite 1</footer>
+<div class="adresse"><span class="zeile">${esc(f.name)} · ${esc(f.anschrift)}</span><br>${esc(d.kunde.name ?? '[Kunde]')}<br>${esc(d.kunde.ansprechpartner ?? '')}${d.kunde.ansprechpartner ? '<br>' : ''}${esc(d.kunde.anschrift ?? '')}</div>
+<h1>Angebot ${esc(d.nr)}${d.version > 1 ? ` · Version ${d.version}` : ''}</h1>
+<div class="meta">Datum ${d.datum} · gültig bis ${d.gueltigBis}${d.termin ? ` · ${esc(d.termin)}` : ''}</div>
+${d.entwurf ? `<div class="entwurf">${esc(d.entwurf)}</div>` : ''}
+${d.abschnitte.map(tabelle).join('\n')}
+${d.nachbestellung ? `<p><strong>${esc(d.nachbestellung)}</strong></p>` : ''}
+${d.ablauf ? `<p>${esc(d.ablauf)}</p>` : ''}
+${d.ustText ? `<p>${esc(d.ustText)}</p>` : ''}
+${d.hinweise.length ? `<h2>Annahmen und Hinweise</h2><ul>${d.hinweise.map((h) => `<li>${esc(h)}</li>`).join('')}</ul>` : ''}
+<footer>${esc(f.name)} · ${esc(f.inhaber)} · Angebot ${esc(d.nr)} · Seite 1</footer>
 </body></html>`;
 }
 
-/** Standardhinweise für Reverse Engineering mit Weitergabe. Vor Nutzung rechtlich prüfen lassen. */
+const BILDMARKE_PFAD = /\sd="([^"]+)"/.exec(BILDMARKE)[1];
+const BLAU = '#1F4E79', GRAU = '#5b6168', LINIE = '#d9dbd6', KUPFER = '#A86A3D';
+
+/** Angebot als PDF-Datei (Uint8Array), gleicher Inhalt wie angebotHtml. */
+function angebotPdf(k, opt) {
+  const d = angebotDaten(k, opt);
+  const f = d.firma;
+  const doc = pdfDokument({ titel: `Angebot ${d.nr}${d.version > 1 ? ` Version ${d.version}` : ''}`, autor: f.inhaber });
+  const L = 20, R = 190, UNTEN = 272;
+  const sp = { pos: L, text: L + 10, menge: 140, einzel: 165, gesamt: R };
+  let y = 0;
+  const fuss = () => {
+    doc.linie(L, 284, R, 284);
+    doc.text(L, 289, `${f.name} · ${f.inhaber} · Angebot ${d.nr}${d.version > 1 ? ` v${d.version}` : ''}`, { groesse: 8, farbe: GRAU });
+    doc.text(R, 289, `Seite ${doc.seitenzahl()}`, { groesse: 8, farbe: GRAU, rechts: true });
+  };
+  const neueSeite = () => { doc.seite(); y = 20; fuss(); };
+  const platz = (h) => { if (y + h > UNTEN) neueSeite(); };
+  const absatz = (text, { groesse = 9.5, fett = false, farbe = '#1F2328', breite = R - L, x = L, abstand = 1.6 } = {}) => {
+    for (const z of umbrechen(text, breite, groesse, fett)) { platz(5); doc.text(x, y, z, { groesse, fett, farbe }); y += groesse * 0.42 + abstand; }
+  };
+  const kopfzeile = () => {
+    doc.text(sp.pos, y, 'Pos.', { groesse: 8, farbe: GRAU }); doc.text(sp.text, y, 'Leistung', { groesse: 8, farbe: GRAU });
+    doc.text(sp.menge, y, 'Menge', { groesse: 8, farbe: GRAU, rechts: true }); doc.text(sp.einzel, y, 'Einzelpreis', { groesse: 8, farbe: GRAU, rechts: true });
+    doc.text(sp.gesamt, y, 'Gesamt', { groesse: 8, farbe: GRAU, rechts: true });
+    y += 1.8; doc.linie(L, y, R, y, { farbe: '#1F2328' }); y += 5;
+  };
+
+  // Seite 1: Kopf, Anschrift, Titel
+  doc.seite(); fuss();
+  doc.svgPfad(BILDMARKE_PFAD, L, 12, 0.26);
+  doc.text(L + 13, 21, 'BELNOK', { groesse: 17, fett: true, farbe: '#1F2328' });
+  [f.inhaber, f.anschrift, f.kontakt].filter(Boolean).forEach((t, i) => doc.text(R, 15 + i * 4, t, { groesse: 8.5, farbe: GRAU, rechts: true }));
+  doc.linie(L, 28, R, 28, { farbe: BLAU, staerke: 0.6 });
+  doc.text(L, 45, `${f.name} · ${f.anschrift}`, { groesse: 7, farbe: GRAU });
+  doc.linie(L, 46.2, L + 85, 46.2);
+  y = 51;
+  for (const t of [d.kunde.name || '[Kunde]', d.kunde.ansprechpartner, d.kunde.anschrift].filter(Boolean)) {
+    for (const z of String(t).split(/\n|,\s*(?=\d{5})/)) { doc.text(L, y, z, { groesse: 10.5 }); y += 5; }
+  }
+  y = Math.max(y + 8, 84);
+  doc.text(L, y, `Angebot ${d.nr}${d.version > 1 ? ` · Version ${d.version}` : ''}`, { groesse: 15, fett: true, farbe: BLAU }); y += 6.5;
+  absatz(`Datum ${d.datum} · gültig bis ${d.gueltigBis}${d.termin ? ` · ${d.termin}` : ''}`, { farbe: GRAU });
+  y += 2;
+  if (d.entwurf) {
+    const z = umbrechen(d.entwurf, R - L - 6, 9.5, true);
+    doc.rechteck(L, y - 1, R - L, z.length * 5.2 + 3, { rand: KUPFER });
+    y += 3.6; for (const t of z) { doc.text(L + 3, y, t, { groesse: 9.5, fett: true, farbe: KUPFER }); y += 5.2; }
+    y += 3;
+  }
+
+  for (const a of d.abschnitte) {
+    platz(30); y += 4;
+    doc.text(L, y, a.titel, { groesse: 11, fett: true, farbe: BLAU }); y += 5.5;
+    if (a.hinweis) absatz(a.hinweis, { groesse: 8.5, farbe: GRAU });
+    y += 1; kopfzeile();
+    for (const g of a.gruppen) {
+      if (g.titel) { platz(12); doc.text(sp.text, y, g.titel, { groesse: 8.5, fett: true, farbe: BLAU }); y += 5; }
+      for (const z of g.zeilen) {
+        const titel = umbrechen(z.text, sp.menge - sp.text - 18, 10, true);
+        const beschr = z.beschreibung ? umbrechen(z.beschreibung, sp.menge - sp.text - 18, 8.5) : [];
+        platz(titel.length * 4.6 + beschr.length * 3.9 + 4);
+        const y0 = y;
+        doc.text(sp.pos, y, String(z.pos), { groesse: 9.5 });
+        doc.text(sp.menge, y, z.einheit === 'pauschal' ? 'pauschal' : `${z.menge} Stk`, { groesse: 9.5, rechts: true });
+        if (z.offen) doc.text(sp.gesamt, y, 'Preis folgt', { groesse: 9.5, rechts: true });
+        else {
+          if (z.einheit !== 'pauschal') doc.text(sp.einzel, y, eur(z.einzel), { groesse: 9.5, rechts: true });
+          doc.text(sp.gesamt, y, eur(z.gesamt), { groesse: 9.5, rechts: true });
+        }
+        for (const t of titel) { doc.text(sp.text, y, t, { groesse: 10, fett: true }); y += 4.6; }
+        for (const t of beschr) { doc.text(sp.text, y, t, { groesse: 8.5, farbe: GRAU }); y += 3.9; }
+        y = Math.max(y, y0 + 4.6) + 0.6; doc.linie(L, y - 3, R, y - 3, { farbe: LINIE }); y += 2.4;
+      }
+    }
+    if (a.nachlass) {
+      platz(12);
+      doc.text(sp.text, y, 'Zwischensumme', { groesse: 9.5 }); doc.text(sp.gesamt, y, eur(a.zwischensumme), { groesse: 9.5, rechts: true }); y += 5;
+      doc.text(sp.text, y, a.nachlass.text, { groesse: 9.5 }); doc.text(sp.gesamt, y, eur(a.nachlass.betrag), { groesse: 9.5, rechts: true }); y += 5;
+    }
+    if (!a.titel.startsWith('Optionen')) {
+      platz(8);
+      doc.text(sp.text, y, a.summeText, { groesse: 10.5, fett: true });
+      doc.text(sp.gesamt, y, a.offen ? 'folgt' : eur(a.summe), { groesse: 10.5, fett: true, rechts: true }); y += 7;
+    }
+  }
+  if (d.nachbestellung) { y += 2; absatz(d.nachbestellung, { fett: true }); }
+  if (d.ablauf) { y += 1; absatz(d.ablauf); }
+  if (d.ustText) { y += 1; absatz(d.ustText); }
+  if (d.hinweise.length) {
+    platz(16); y += 4;
+    doc.text(L, y, 'Annahmen und Hinweise', { groesse: 11, fett: true, farbe: BLAU }); y += 5.5;
+    for (const h of d.hinweise) {
+      const z = umbrechen(h, R - L - 5, 9);
+      platz(z.length * 4.4);
+      doc.text(L, y, '•', { groesse: 9 });
+      for (const t of z) { doc.text(L + 4, y, t, { groesse: 9 }); y += 4.4; }
+      y += 0.8;
+    }
+  }
+  return doc.bytes();
+}
+
+/** Standardhinweise für Reverse Engineering. Vor Nutzung rechtlich prüfen lassen. */
 const STANDARDHINWEISE_RE = [
   'Grundlage sind das bereitgestellte Musterteil sowie Fotos und Angaben des Kunden. Maße, die am Muster nicht eindeutig bestimmbar sind (Verschleiß, Verzug), werden nach technischer Einschätzung festgelegt und im Prototyp geprüft.',
   'Der Prototyp dient der Prüfung von Form, Passung und Funktion; er ist kein Serienteil.',
-  'Die Leistungen nach Freigabe werden von einem Fertigungspartner hergestellt. Werkstoff, Toleranzen und Oberflächen werden vor Auftragserteilung schriftlich festgelegt.',
+  'Werkstoff, Toleranzen und Oberflächen werden vor Fertigungsbeginn schriftlich festgelegt.',
   '[Haftungs- und Gewährleistungstext: vor dem ersten Versand von einer Fachstelle prüfen lassen.]',
 ];
 
+/** Hinweise je Angebot: Reverse Engineering, Fertigungspartner nur bei Fremdleistung, beigestelltes Material. */
+function standardHinweise(k) {
+  return [...((k.phasen ?? []).some((x) => x.auftragsart === 'Reverse Engineering') ? STANDARDHINWEISE_RE : []),
+    ...(fremd(k) ? ['Die Fertigung übernimmt ein Fertigungspartner.'] : []),
+    ...(k.materialFrei?.herkunft === 'beigestellt' ? ['Das Material wird vom Auftraggeber beigestellt.'] : [])];
+}
+
 // ---------------------------------------------------------------- Angebotsverlauf und Kundenfreigabe
 
-const ANGEBOTSSTATUS = ['Entwurf', 'versendet', 'angenommen', 'abgelehnt', 'abgelaufen'];
+// 0.26: „freigegeben“ = Erik hat das PDF geprüft, es darf an den Kunden (später verschickt es die KI).
+const ANGEBOTSSTATUS = ['Entwurf', 'freigegeben', 'versendet', 'angenommen', 'abgelehnt', 'abgelaufen'];
 
 /** Status eines Angebots ändern; der Verlauf wird nur angehängt. */
 function angebotStatus(k, status, { datum, notiz = '' } = {}) {
@@ -2948,11 +3305,11 @@ function angebotAbgelaufen(k, { heute, gueltigTage = 30 }) {
   return Date.parse(heute) > bis;
 }
 
-return { BILDMARKE, UST_MODI, angebotsPositionen, nachlassZeile, angebotHtml, STANDARDHINWEISE_RE, ANGEBOTSSTATUS, angebotStatus, angebotAbgelaufen };
+return { BILDMARKE, UST_MODI, angebotsPositionen, nachlassZeile, teilText, angebotsZeilen, angebotDaten, angebotHtml, angebotPdf, STANDARDHINWEISE_RE, standardHinweise, ANGEBOTSSTATUS, angebotStatus, angebotAbgelaufen };
 })();
 
 // ---- src/sha256.js
-const __m_sha256_26 = (() => {
+const __m_sha256_27 = (() => {
 // SHA-256 ohne Abhängigkeiten (läuft im Browser und in Node), für Prüfsummen archivierter Belege.
 
 const K = new Uint32Array([
@@ -3015,9 +3372,9 @@ const __m_rechnungen_19 = (() => {
 // gelten die Erleichterungen der Kleinbetragsrechnung (§ 33 UStDV) für die Kundenanschrift.
 
 const { kalkFuerAuftrag } = __m_staende_20;
-const { angebotsPositionen, nachlassZeile, BILDMARKE } = __m_angebot_25;
+const { angebotsZeilen, nachlassZeile, BILDMARKE } = __m_angebot_25;
 const { kalkuliere, preisPosition } = __m_kalkulation_1;
-const { sha256 } = __m_sha256_26;
+const { sha256 } = __m_sha256_27;
 const { cent, zahl, gesetzt } = __m_runden_2;
 const { gruppe, eintrag } = __m_verzeichnis_10;
 
@@ -3050,10 +3407,11 @@ function rechnungsEntwurf(db, auftragNr, { leistungsdatum } = {}) {
   const hinweise = [];
   let positionen;
   if (Array.isArray(k.phasen)) {
-    const pos = angebotsPositionen(k, stamm).filter((p) => p.bedingung === 'sofort' || k.teil2Beauftragt);
+    // 0.26: gleicher Aufbau wie das Angebot (Einmalkosten, Teil mit Stückpreis, Lieferung)
+    const pos = angebotsZeilen(k, stamm).filter((p) => p.bedingung === 'sofort' || (k.teil2Beauftragt && p.bedingung === 'nach Kundenfreigabe'));
     if (pos.some((p) => p.offen)) hinweise.push('Eine Position hat noch keinen Preis (Zulieferer)');
-    positionen = pos.map((p) => ({ text: p.text, beschreibung: p.beschreibung, menge: p.menge, einheit: p.pauschal ? 'pauschal' : 'Stk',
-      einzel: p.einzel, gesamt: p.gesamt, stueckInfo: p.pauschal ? `${p.stueckzahl} Stück` : '' }));
+    positionen = pos.map((p) => ({ text: p.text, beschreibung: p.beschreibung, menge: p.menge, einheit: p.einheit,
+      einzel: p.einzel, gesamt: p.gesamt, stueckInfo: '' }));
     const nl = nachlassZeile(k, cent(pos.filter((p) => p.bedingung === 'sofort').reduce((s, p) => s + p.gesamt, 0)));
     if (nl) positionen.push({ text: nl.text, beschreibung: '', menge: 1, einheit: '', einzel: nl.betrag, gesamt: nl.betrag });
     if (!kf.stand) hinweise.push('Kein eingefrorener Kalkulationsstand: Preise mit den heutigen Stammdaten gerechnet');
@@ -3423,7 +3781,7 @@ return { KUNDENARTEN, KUNDENFELDER, kundenartVorschlag, kundePflichtFehlt, naech
 })();
 
 // ---- src/finanzen.js
-const __m_finanzen_27 = (() => {
+const __m_finanzen_28 = (() => {
 // Finanzen: Fixkosten, Konten, Einnahmen/Ausgaben, Monatszahlen, Mindestumsatz und Ziele.
 //
 // Grundsätze (Wunsch Erik 26.10.2026):
@@ -3443,7 +3801,7 @@ const __m_finanzen_27 = (() => {
 const { kalkFuerAuftrag } = __m_staende_20;
 const { kalkulierePhasen } = __m_phasen_21;
 const { kalkuliere } = __m_kalkulation_1;
-const { angebotsPositionen, nachlassZeile } = __m_angebot_25;
+const { angebotsZeilen, nachlassZeile } = __m_angebot_25;
 const { cent, zahl, gesetzt, runde } = __m_runden_2;
 
 const RHYTHMEN = { monatlich: 12, 'vierteljährlich': 4, 'halbjährlich': 2, 'jährlich': 1 };
@@ -3730,8 +4088,8 @@ function auftragswert(db, a) {
       if (Array.isArray(kf.k.phasen)) {
         // wie die Rechnung: Angebotspositionen (Teil 2 nur, wenn beauftragt) und Rabattzeile
         const r = kalkulierePhasen(kf.k, kf.stamm);
-        const teil2 = kf.k.teil2Beauftragt && r.optional;
-        const pos = angebotsPositionen(kf.k, kf.stamm).filter((p) => p.bedingung === 'sofort' || teil2);
+        const teil2 = kf.k.teil2Beauftragt && r.stufenangebot && r.optional;
+        const pos = angebotsZeilen(kf.k, kf.stamm).filter((p) => p.bedingung === 'sofort' || (teil2 && p.bedingung === 'nach Kundenfreigabe'));
         const sofort = cent(pos.filter((p) => p.bedingung === 'sofort').reduce((s2, p) => s2 + p.gesamt, 0));
         w.wert ??= cent(pos.reduce((s2, p) => s2 + p.gesamt, 0) + (nachlassZeile(kf.k, sofort)?.betrag ?? 0));
         w.variabel = cent(r.sofort.barausgaben + (teil2 ? r.optional.barausgaben : 0));
@@ -4006,12 +4364,12 @@ const { cent, runde, zahl, gesetzt } = __m_runden_2;
 const { kundeNach, kundenNrSetzen } = __m_kunden_18;
 const { zeit, MIN_TAG } = __m_zeit_7;
 const { kalkuliere, preisPosition } = __m_kalkulation_1;
-const { kalkulierePhasen } = __m_phasen_21;
-const { angebotsPositionen, nachlassZeile } = __m_angebot_25;
+const { kalkulierePhasen, stufenangebot } = __m_phasen_21;
+const { angebotsZeilen, nachlassZeile } = __m_angebot_25;
 const { schrittId } = __m_planung_9;
 const { letzterStand, kalkFuerAuftrag } = __m_staende_20;
 const { pruefeRechnungen } = __m_rechnungen_19;
-const { finanzenMigrieren } = __m_finanzen_27;
+const { finanzenMigrieren } = __m_finanzen_28;
 const { schritteVon } = __m_verzeichnis_10;
 
 const AUFTRAGSSTATUS = ['Anfrage', 'Kalkuliert', 'Angebot raus', 'Beauftragt', 'Freigegeben', 'In Arbeit',
@@ -4157,7 +4515,7 @@ function kalkFlach(k, stamm) {
     return { ...r, eigenzeitMin: zahl(k.eigenzeitMin), maschinenzeit: r.maschinenzeit };
   }
   const r = kalkulierePhasen(k, stamm);
-  const teile = k.teil2Beauftragt ? [r.sofort, r.optional].filter(Boolean) : [r.sofort];
+  const teile = k.teil2Beauftragt && r.stufenangebot ? [r.sofort, r.optional].filter(Boolean) : [r.sofort];
   const sum = (f) => cent(teile.reduce((a, t) => a + (t[f] ?? 0), 0));
   return {
     zielpreis: sum('zielpreis'), direkteKosten: sum('direkteKosten'), ki: sum('ki'), material: sum('material'),
@@ -4344,15 +4702,15 @@ function rechnungsdatenCsv(db, auftragNr, { leistungsdatum } = {}) {
   const fmt0 = (n) => n.toFixed(2).replace('.', ',');
   const esc0 = (s) => `"${String(s ?? '').replace(/"/g, '""')}"`;
   if (Array.isArray(k?.phasen)) {
-    const pos = angebotsPositionen(k, stamm).filter((p) => p.bedingung === 'sofort' || k.teil2Beauftragt);
+    const pos = angebotsZeilen(k, stamm).filter((p) => p.bedingung === 'sofort' || (k.teil2Beauftragt && p.bedingung === 'nach Kundenfreigabe'));
     const zeilen = pos.map((p, i) => [esc0(a.kunde), a.nr, leistungsdatum ?? a.geliefert ?? '',
-      esc0(p.pauschal ? `${p.text} (${p.stueckzahl} Stück, pauschal)` : p.text), p.menge, fmt0(p.einzel), fmt0(p.gesamt),
-      esc0(kundeNach(db, a.kunde)?.lexwareNr), esc0(k.phasen[p.nr - 1]?.lexwareNr || k.lexwareNr)].join(';'));
+      esc0(p.einheit === 'pauschal' ? `${p.text} (pauschal)` : p.text), p.menge, fmt0(p.einzel), fmt0(p.gesamt),
+      esc0(kundeNach(db, a.kunde)?.lexwareNr), esc0(p.lexwareNr || k.lexwareNr)].join(';'));
     const nl = nachlassZeile(k, cent(pos.filter((p) => p.bedingung === 'sofort').reduce((x, p) => x + p.gesamt, 0)));
     if (nl) zeilen.push([esc0(a.kunde), a.nr, leistungsdatum ?? a.geliefert ?? '', esc0(nl.text), 1, fmt0(nl.betrag), fmt0(nl.betrag),
       esc0(kundeNach(db, a.kunde)?.lexwareNr), '""'].join(';'));
     return { csv: `${KOPF}\n${zeilen.join('\n')}\n`,
-      warnung: k.teil2Beauftragt ? '' : 'Leistungen „nach Kundenfreigabe“ nicht enthalten, weil noch nicht freigegeben', positionen: pos };
+      warnung: k.teil2Beauftragt || !stufenangebot(k) ? '' : 'Leistungen „nach Kundenfreigabe“ nicht enthalten, weil noch nicht freigegeben', positionen: pos };
   }
   const gesamt = gesetzt(a.angebotspreis) ? zahl(a.angebotspreis) : kalkuliere(k, stamm).zielpreis;
   const pos = preisPosition(gesamt, zahl(k?.menge, 1), stamm.parameter.preisbasis);
@@ -4699,7 +5057,7 @@ return { teilNach, teilAnlegen, aehnlichBenannt, loeschHindernisse, teilLoeschen
 })();
 
 // ---- src/feiertage.js
-const __m_feiertage_30 = (() => {
+const __m_feiertage_31 = (() => {
 // Gesetzliche Feiertage in Sachsen (bundesweite plus Reformationstag und Buß- und Bettag).
 // Fronleichnam gilt nur in einigen Gemeinden der Landkreise Bautzen und Görlitz -> abschaltbar.
 
@@ -4745,7 +5103,7 @@ return { ostersonntag, feiertageSachsen, feiertag };
 })();
 
 // ---- src/zeiterfassung.js
-const __m_zeiterfassung_29 = (() => {
+const __m_zeiterfassung_30 = (() => {
 // Zeiterfassung: Kommen/Gehen stempeln, Tageszeiten, Saldo, Urlaub und Anträge.
 //
 // Regeln
@@ -4762,7 +5120,7 @@ const __m_zeiterfassung_29 = (() => {
 
 const { zeit, text, tagVon, MIN_TAG, wochentag } = __m_zeit_7;
 const { zahl, gesetzt, runde } = __m_runden_2;
-const { feiertag } = __m_feiertage_30;
+const { feiertag } = __m_feiertage_31;
 
 const ANTRAGSARTEN = ['Urlaub', 'Überstundenabbau', 'Krank', 'Berufsschule (Sondertermin)', 'Feiertag'];
 const GUTSCHRIFT = { Urlaub: true, Krank: true, 'Berufsschule (Sondertermin)': true, Feiertag: true, Überstundenabbau: false };
@@ -4956,7 +5314,7 @@ return { ANTRAGSARTEN, person, gueltigeStempel, stempeln, istEingestempelt, soll
 })();
 
 // ---- src/orga.js
-const __m_orga_31 = (() => {
+const __m_orga_32 = (() => {
 // Werkstatt-Organisation (0.15): Aufgaben, Meldungen, Termine, Schwarzes Brett.
 //
 // Aufgaben   für eine Person, eine Maschine, eine Abteilung oder alle; einmalig oder
@@ -5545,7 +5903,7 @@ return { ZUSTAENDIGKEITEN, AUFGABENARTEN, RHYTHMEN_AUFGABE, ZIELARTEN, NACHWEISE
 })();
 
 // ---- src/ressourcen.js
-const __m_ressourcen_28 = (() => {
+const __m_ressourcen_29 = (() => {
 // Wer und was steht wann zur Verfügung: Mitarbeiter mit Schicht, Urlaub, Krankheit
 // und Berufsschule, dazu die Maschinen mit ihrer Betriebsart.
 //
@@ -5558,9 +5916,9 @@ const __m_ressourcen_28 = (() => {
 
 const { zeit, tagVon, tagBeginn, wochentag, wochentagName, uhrzeit, text } = __m_zeit_7;
 const { zahl, gesetzt } = __m_runden_2;
-const { sollMin } = __m_zeiterfassung_29;
-const { feiertag } = __m_feiertage_30;
-const { maschinenSperren, personBelegt } = __m_orga_31;
+const { sollMin } = __m_zeiterfassung_30;
+const { feiertag } = __m_feiertage_31;
+const { maschinenSperren, personBelegt } = __m_orga_32;
 
 const BETRIEBSARTEN = ['bedient', 'halbautomatisch', 'autonom'];
 const SCHICHTEN = ['Normal', 'Früh', 'Spät', 'Nacht'];
@@ -5698,7 +6056,7 @@ const { zeit, text, MIN_TAG } = __m_zeit_7;
 const { planeSchritte, schrittId } = __m_planung_9;
 const { sortiereSchritte } = __m_reihenfolge_6;
 const { teilNach, stueckzahl } = __m_teile_14;
-const { ressourcen: ressourcenVon } = __m_ressourcen_28;
+const { ressourcen: ressourcenVon } = __m_ressourcen_29;
 const { lexwareNrSetzen, naechsteLieferantenNr, standMerken } = __m_nummern_15;
 const { entfaellt } = __m_phasen_21;
 const { kgJeEinheit: kgAusAbmessung } = __m_material_17;
@@ -6453,7 +6811,7 @@ return { arbeitsplatz, freigabeNach, buche };
 })();
 
 // ---- src/vendor/qrcode.js
-const __m_qrcode_33 = (() => {
+const __m_qrcode_34 = (() => {
 // qrcode-generator 1.4.4 (Kazuhiko Arase, MIT-Lizenz), unverändert bis auf den Export.
 // Quelle: npm qrcode-generator@1.4.4
 
@@ -8751,12 +9109,12 @@ return { qrcode };
 })();
 
 // ---- src/laufzettel.js
-const __m_laufzettel_32 = (() => {
+const __m_laufzettel_33 = (() => {
 // Laufzettel je Auftrag (A4, zum Ausdrucken) mit QR-Codes.
 // QR-Inhalt ist kurzer Text, z. B. "BELNOK:A-2026-004" bzw. "BELNOK:A-2026-004-3",
 // damit ein Handy-Scanner später direkt den Auftrag bzw. Schritt öffnen kann.
 
-const { qrcode } = __m_qrcode_33;
+const { qrcode } = __m_qrcode_34;
 const { schrittId } = __m_planung_9;
 const { text } = __m_zeit_7;
 const { zahl, gesetzt } = __m_runden_2;
@@ -8819,7 +9177,7 @@ return { qrSvg, qrInhalt, laufzettelHtml };
 })();
 
 // ---- src/abgleich.js
-const __m_abgleich_34 = (() => {
+const __m_abgleich_35 = (() => {
 // Abgleich zweier Bearbeitungsstände (Drei-Wege-Zusammenführung).
 //
 // Mehrere Leute arbeiten gleichzeitig: der Bediener bucht einen Schritt, der Chef
@@ -8904,7 +9262,7 @@ return { zusammenfuehren3 };
 })();
 
 // ---- src/lieferschein.js
-const __m_lieferschein_35 = (() => {
+const __m_lieferschein_36 = (() => {
 // Lieferschein zum Auftrag: was geht an den Kunden (ohne Preise), zum Ausdrucken und
 // Unterschreiben lassen. Nummer = Auftragsnummer mit LS davor (ein Lieferschein je Lieferung).
 
@@ -8962,7 +9320,7 @@ return { lieferPositionen, lieferscheinHtml };
 })();
 
 // ---- src/beispiel.js
-const __m_beispiel_36 = (() => {
+const __m_beispiel_37 = (() => {
 // Platzhalterwerte aus der V0-Arbeitsmappe v3 (18.10.2026). FIKTIV – keine echten Werte.
 
 const beispielStamm = () => ({
@@ -9047,7 +9405,7 @@ return { beispielStamm, beispielKalkulationen, startStamm };
 })();
 
 // ---- src/stl.js
-const __m_stl_37 = (() => {
+const __m_stl_38 = (() => {
 // STL lesen (binär und Text) für die 3D-Ansicht und das Vorschaubild eines Teils.
 // STEP und SolidWorks-Dateien kann der Browser nicht darstellen; dafür beim Export aus
 // SolidWorks zusätzlich eine STL speichern.
@@ -9143,7 +9501,7 @@ return { stlLesen, stlMasse, stlProjizieren, stlDrehung, stlPunktUnter };
 })();
 
 // ---- src/faehigkeiten.js
-const __m_faehigkeiten_38 = (() => {
+const __m_faehigkeiten_39 = (() => {
 // Was kann welche Maschine? (0.24)
 // Maschine: Düse/Bett/Bauraum max °C, Bauraum geschlossen/beheizt, gehärtete Düse, Bauraum mm,
 // Filament-Fächer (am Drucker + im Zubehör, z. B. QIDI Box mit 4 Fächern).
@@ -9256,7 +9614,7 @@ return { MASCHINE_FAEHIGKEIT, WERKSTOFF_ANFORDERUNG, FILAMENT_RICHTWERTE, richtw
 })();
 
 // ---- src/ki.js
-const __m_ki_39 = (() => {
+const __m_ki_40 = (() => {
 // KI-Unterstützung für Anfragen (Autonomiestufe 1–2: vorschlagen, Entwurf).
 //
 // Ablauf ohne API-Schlüssel und ohne Upload aus der App:
@@ -9399,7 +9757,7 @@ return { kiAuftragsbrief, kiVorschlagEinlesen, kiVorschlagUebernehmen };
 })();
 
 // ---- src/schritte.js
-const __m_schritte_40 = (() => {
+const __m_schritte_41 = (() => {
 // Arbeitsschritte aus einer Kalkulation vorschlagen, damit ein neuer Auftrag
 // sofort in der Terminplanung steht. Die Schritte sind ein Vorschlag: Namen,
 // Dauern und Reihenfolge danach im Auftrag prüfen und anpassen.
@@ -9560,12 +9918,12 @@ return { maxStueckMin, teile, schritteAusKalkulation, schritteAnlegen };
 })();
 
 // ---- src/kundenfreigabe.js
-const __m_kundenfreigabe_41 = (() => {
+const __m_kundenfreigabe_42 = (() => {
 // Kundenfreigabe des Prototyps = Auftrag für Teil 2 (z. B. Fertigung beim Zulieferer).
 // Hält Datum und Notiz fest, setzt Teil 2 auf beauftragt und hängt die Schritte
 // von Teil 2 an den bestehenden Auftrag an.
 
-const { schritteAnlegen } = __m_schritte_40;
+const { schritteAnlegen } = __m_schritte_41;
 
 const FREIGABEARTEN = ['E-Mail', 'Unterschrift', 'Telefon', 'persönlich', 'Messenger'];
 
@@ -9604,7 +9962,7 @@ return { FREIGABEARTEN, teil2Freigeben };
 })();
 
 // ---- src/wartung.js
-const __m_wartung_43 = (() => {
+const __m_wartung_44 = (() => {
 // Maschinen-Logbuch und Wartungsintervalle je Maschine.
 //
 // Logbuch = nur anhängen. Einträge: Stundenstand (Zählerstand Betriebs- bzw.
@@ -9740,14 +10098,14 @@ return { LOG_ARTEN, LOG_KOSTENARTEN, AKTE_BEREICHE, AKTE_OEFFENTLICH, maschinenI
 })();
 
 // ---- src/heute.js
-const __m_heute_42 = (() => {
+const __m_heute_43 = (() => {
 // Startseite "Heute": was ansteht, nach Dringlichkeit sortiert.
 // Liest nur; ändert nichts an den Daten.
 
 const { zeit, MIN_TAG } = __m_zeit_7;
 const { gesetzt, zahl } = __m_runden_2;
 const { fortschritt, schrittId } = __m_planung_9;
-const { wartungsStatus } = __m_wartung_43;
+const { wartungsStatus } = __m_wartung_44;
 const { angebotAbgelaufen } = __m_angebot_25;
 
 const DRINGLICH = { rot: 0, gelb: 1, info: 2 };
@@ -9789,6 +10147,8 @@ function tagesUebersicht(db, { heute, jetzt, plan, nachfassenTage = 14, material
         e.push({ stufe: 'gelb', bereich: 'Angebot', text: `${k.angebot.nr} (${k.kunde || 'ohne Kunde'}): Gültigkeit abgelaufen – nachfassen`, ziel: { kalk: k.nr } });
       } else if (st === 'versendet') {
         e.push({ stufe: 'info', bereich: 'Angebot', text: `${k.angebot.nr} (${k.kunde || 'ohne Kunde'}): wartet auf Antwort seit ${k.angebot.verlauf?.at(-1)?.datum ?? k.angebot.datum}`, ziel: { kalk: k.nr } });
+      } else if (st === 'freigegeben') {
+        e.push({ stufe: 'gelb', bereich: 'Angebot', text: `${k.angebot.nr} (${k.kunde || 'ohne Kunde'}): freigegeben, noch an den Kunden schicken`, ziel: { kalk: k.nr } });
       } else if (st === 'Entwurf') {
         e.push({ stufe: 'info', bereich: 'Angebot', text: `${k.angebot.nr} (${k.kunde || 'ohne Kunde'}): Entwurf, noch nicht versendet`, ziel: { kalk: k.nr } });
       }
@@ -9859,7 +10219,7 @@ return { tagesUebersicht };
 })();
 
 // ---- src/entwurf.js
-const __m_entwurf_44 = (() => {
+const __m_entwurf_45 = (() => {
 // Einzelne Kalkulation aus einer Datei hinzufügen (z. B. ein von Claude
 // vorbereiteter Entwurf). Ersetzt nichts: Die Kalkulation bekommt die nächste
 // freie Nummer, vorhandene Daten bleiben unverändert.
@@ -9889,7 +10249,7 @@ return { entwurfHinzufuegen };
 })();
 
 // ---- src/ablage-ordner.js
-const __m_ablage_ordner_45 = (() => {
+const __m_ablage_ordner_46 = (() => {
 // Speichern in einen echten Ordner auf dem PC über die File System Access API
 // (Edge und Chrome; Firefox kann das nicht -> dort Export/Import nutzen).
 // Gleiche Regeln wie speicher-datei.js: eine Hauptdatei, tägliches Backup,
@@ -9956,7 +10316,7 @@ return { DATEI, BACKUPS, ordnerLaden, ordnerSpeichern };
 })();
 
 // ---- src/moonraker.js
-const __m_moonraker_46 = (() => {
+const __m_moonraker_47 = (() => {
 // Import der Druckdaten aus Moonraker (Klipper), z. B. QIDI Plus 4.
 //
 // Quellen (Moonraker-API-Dokumentation, "History"):
@@ -10066,7 +10426,7 @@ return { ortszeit, filamentGramm, stundenstandAusTotals, jobsAusHistorie, auftra
 })();
 
 // ---- src/doku.js
-const __m_doku_48 = (() => {
+const __m_doku_49 = (() => {
 // Fertigungs-Dokumentation je Teil: was die Leute an der Maschine festhalten
 // (Aufspannung, Werkzeuge, Probleme, Fotos), damit es beim nächsten Auftrag mit dem
 // Teil gleich mit aufgeht. Ähnliche Teile lassen sich verknüpfen: deren Doku dient als
@@ -10139,7 +10499,7 @@ return { DOKU_ARTEN, dokuHinzufuegen, aehnlicheSetzen, dokuSichtbar, dokuFuerTei
 })();
 
 // ---- src/verkauf.js
-const __m_verkauf_49 = (() => {
+const __m_verkauf_50 = (() => {
 // Lagerverkauf (Stufe 2 des Zielbilds): eigene Produkte ab Lager verkaufen.
 //
 // - Verkaufsartikel = Lagerartikel (Fertigteil/Handelsware) mit „wird verkauft“, verknüpft
@@ -10160,7 +10520,7 @@ const { zahl, gesetzt, runde, cent } = __m_runden_2;
 const { lagerVon, artikelNach, bestand, buchen } = __m_lager_13;
 const { naechsteNummer, auftragAusKalkulation } = __m_auftraege_16;
 const { wiederholKalkulation, teilNach } = __m_teile_14;
-const { schritteAnlegen } = __m_schritte_40;
+const { schritteAnlegen } = __m_schritte_41;
 const { schrittId } = __m_planung_9;
 
 const VERKAUFSQUELLEN = ['Shop', 'E-Mail', 'Telefon', 'persönlich', 'Marktplatz'];
@@ -10341,7 +10701,7 @@ return { VERKAUFSQUELLEN, VERSANDSTATUS, istVerkaufsartikel, setTeile, verkaufAn
 })();
 
 // ---- src/rollen.js
-const __m_rollen_47 = (() => {
+const __m_rollen_48 = (() => {
 // Rollen und Sichten für den Mehrbenutzer-Betrieb (Server).
 //
 // Chef      sieht und ändert alles, verwaltet Zugänge und Personal.
@@ -10355,9 +10715,9 @@ const __m_rollen_47 = (() => {
 
 const { materialPlanung } = __m_lager_13;
 const { bereichVon } = __m_werkstatt_11;
-const { dokuSichtbar } = __m_doku_48;
-const { werBin, orgaSicht } = __m_orga_31;
-const { versandListe } = __m_verkauf_49;
+const { dokuSichtbar } = __m_doku_49;
+const { werBin, orgaSicht } = __m_orga_32;
+const { versandListe } = __m_verkauf_50;
 
 const ROLLEN = ['Chef', 'Meister', 'Bediener'];
 const ZEITFELDER = ['personal', 'stempel', 'zeitkorrekturen', 'antraege'];
@@ -10545,14 +10905,14 @@ return { ROLLEN, ZEITFELDER, ansichtenFuer, darfSpeichern, logOhneKosten, maschi
 })();
 
 // ---- src/strichcode.js
-const __m_strichcode_50 = (() => {
+const __m_strichcode_51 = (() => {
 // Strichcode (Code 128, Zeichensatz B) als SVG und Lager-Etiketten zum Ausdrucken.
 //
 // Etikett je Artikel: Strichcode mit der Lexware-Nr (für Handscanner am PC, die
 // wie eine Tastatur tippen) und QR-Code mit dem Link ins ERP (Handy-Kamera öffnet
 // direkt das Ein-/Auslagern des Artikels).
 
-const { qrSvg } = __m_laufzettel_32;
+const { qrSvg } = __m_laufzettel_33;
 
 // Balkenbreiten je Code-Wert 0–105 (Strich, Lücke, Strich, Lücke, Strich, Lücke)
 const MUSTER = ('212222 222122 222221 121223 121322 131222 122213 122312 132212 221213 221312 231212 112232 122132 122231 113222 '
@@ -10622,7 +10982,7 @@ return { code128, strichcodeSvg, scanLink, etikettenHtml };
 })();
 
 // ---- src/rueckmeldung.js
-const __m_rueckmeldung_51 = (() => {
+const __m_rueckmeldung_52 = (() => {
 // Rückmeldung je Arbeitsschritt (Laufzettel): Gutteile, Ausschuss, Ist-Zeit, Bemerkung –
 // und daraus die Prüfliste für die Arbeitsvorbereitung: wo lag die Kalkulation daneben,
 // wo gab es Ausschuss oder Bemerkungen. Nur Regeln, keine KI; die Prüfliste kann als
@@ -10688,7 +11048,7 @@ return { STANDARD_GRENZEN, istMin, rueckmeldungen, pruefliste, kiPruefText };
 })();
 
 // ---- src/uebersicht.js
-const __m_uebersicht_52 = (() => {
+const __m_uebersicht_53 = (() => {
 // Übersicht für Chef und Arbeitsvorbereitung: Liefertermine, was bis Ende der Woche
 // raus muss, offene Beträge, und wie jeder Bereich (Fräserei, Dreherei, 3D-Druck,
 // Konstruktion, Versand …) und jede Maschine dasteht. Liest nur.
@@ -10780,7 +11140,7 @@ return { wochenende, uebersicht };
 })();
 
 // ---- src/vendor/jsqr.js
-const __m_jsqr_54 = (() => {
+const __m_jsqr_55 = (() => {
 // jsQR 1.4.0 (https://github.com/cozmo/jsQR), Apache-2.0 – QR-Codes in Kamerabildern lesen.
 // Unverändert eingebunden; nur in eine Funktion gepackt, damit es als Modul im ERP läuft.
 
@@ -20901,7 +21261,7 @@ return { jsQR };
 })();
 
 // ---- src/scanner.js
-const __m_scanner_53 = (() => {
+const __m_scanner_54 = (() => {
 // Scannen mit der Kamera: QR-Code im Bild finden und deuten.
 //
 // Lager-Etikett:  Link …#lager/<Lexware-Nr>  → Artikel zum Ein- und Auslagern
@@ -20909,7 +21269,7 @@ const __m_scanner_53 = (() => {
 //                 BELNOK:<Auftrag>            → Auftrag
 // Sonst (Strichcode vom Handscanner, getippte Nummer) → Suche im Lager.
 
-const { jsQR } = __m_jsqr_54;
+const { jsQR } = __m_jsqr_55;
 
 /** QR-Code in RGBA-Bilddaten suchen; liefert den Text oder null. */
 function codeLesen(rgba, breite, hoehe) {
@@ -20931,7 +21291,7 @@ return { codeLesen, codeDeuten };
 })();
 
 // ---- src/delta.js
-const __m_delta_55 = (() => {
+const __m_delta_56 = (() => {
 // Nur Änderungen speichern: Unterschied zwischen zwei Datenbankständen und das Anwenden darauf.
 // Nach Jahren ist die Datenbank zig MB groß; beim Speichern einer Kleinigkeit soll nicht jedes
 // Mal alles übertragen und verglichen werden.
@@ -21026,7 +21386,7 @@ return { delta, anwenden, textMerker };
 })();
 
 // ---- src/auslastung.js
-const __m_auslastung_56 = (() => {
+const __m_auslastung_57 = (() => {
 // Auslastung der Leute und Programmier-Vorlauf (Stufe 2b).
 //
 // Bedienlast: wie viel ihrer Anwesenheit eine Person laut Plan gebunden ist – Eigenarbeit,
@@ -21153,7 +21513,7 @@ return { PROGRAMMIER_ZIEL_TAGE, PROGRAMMIER_MIN_TAGE, istCncMaschine, bedienlast
 })();
 
 // ---- src/qualitaet.js
-const __m_qualitaet_57 = (() => {
+const __m_qualitaet_58 = (() => {
 // Qualität: Prüfplan je Teil und Revision, Erstteilprüfung mit Sperre, Prüfprotokolle.
 //
 // Aufgabenteilung mit der eigenständigen Messsoftware: das ERP legt fest, WAS WANN WO
@@ -21165,7 +21525,7 @@ const __m_qualitaet_57 = (() => {
 // aufbewahrt (Annahme, in den Parametern änderbar; Kundenvorgaben können länger sein).
 
 const { zahl, gesetzt, runde } = __m_runden_2;
-const { teilZuAuftrag } = __m_doku_48;
+const { teilZuAuftrag } = __m_doku_49;
 
 const MERKMALARTEN = ['Maß', 'Form / Lage', 'Gewinde', 'Oberfläche', 'Sicht'];
 const PRUEFORTE = ['an der Maschine', 'Messmaschine', 'Messraum'];
@@ -21420,55 +21780,55 @@ const { kalkuliere, SCHAETZQUALITAET, MATERIALHERKUNFT, KOSTENARTEN, KM_SATZ, ge
 const { maschinenSatz, maschinenUebersicht, MASCHINENTYPEN, heizungZuschlag, strompreisFuer, anschaffungGesamt, leistungGesamt } = __m_maschinen_3;
 const { sortiereSchritte, PRIORITAETEN, MATERIALSTATUS, grundText } = __m_reihenfolge_6;
 const { arbeitsplatz, buche, freigabeNach } = __m_arbeitsplatz_8;
-const { laufzettelHtml } = __m_laufzettel_32;
+const { laufzettelHtml } = __m_laufzettel_33;
 const { erstelleKalender, planeSchritte, fortschritt, wochenplan, terminVorschlag, eilauftragCheck, schrittId, TYPEN, STATUS } = __m_planung_9;
 const { neueDatenbank, pruefeDatenbank, naechsteNummer, auftragAusKalkulation, auftragsKennzahlen, nachkalkulation, pruefeFreigabe, freigeben, aenderungErfassen, rechnungsdatenCsv, AUFTRAGSSTATUS, RISIKOKLASSEN, migriere, ARBEITSPLAN_VORLAGEN } = __m_auftraege_16;
-const { zusammenfuehren3 } = __m_abgleich_34;
-const { ressourcen, schichtUebersicht, betriebsart, BETRIEBSARTEN, SCHICHTMODELLE, SCHICHTEN, STANDARD_SCHICHTZEITEN } = __m_ressourcen_28;
-const { lieferPositionen, lieferscheinHtml } = __m_lieferschein_35;
-const { beispielStamm, beispielKalkulationen } = __m_beispiel_36;
+const { zusammenfuehren3 } = __m_abgleich_35;
+const { ressourcen, schichtUebersicht, betriebsart, BETRIEBSARTEN, SCHICHTMODELLE, SCHICHTEN, STANDARD_SCHICHTZEITEN } = __m_ressourcen_29;
+const { lieferPositionen, lieferscheinHtml } = __m_lieferschein_36;
+const { beispielStamm, beispielKalkulationen } = __m_beispiel_37;
 const { kalkulierePhasen, BEDINGUNGEN, entfaellt, mengeUmrechnen, rabattProzent } = __m_phasen_21;
 const { verschleissVorschlag } = __m_verschleiss_5;
 const { phasenartVon, phasenartPruefen, PHASENARTEN_NEU, neuePhaseNeu, artNeu, BASIS_TEXT } = __m_phasenarten_23;
 const { VERFAHREN, verfahrenVon, werkstoffNach, grammJeMm, materialArtikel, materialText, preisAlt, werkstoffListe, farbenFuer, abmessungVorschlaege, laengeMm } = __m_material_17;
-const { stlLesen, stlProjizieren, stlMasse, stlDrehung, stlPunktUnter } = __m_stl_37;
+const { stlLesen, stlProjizieren, stlMasse, stlDrehung, stlPunktUnter } = __m_stl_38;
 const { rollenVon, anMaschine, rolleEntnehmen, rolleZurueck, rolleLeer, rolleWiegen } = __m_rollen_maschine_12;
 const { gcodeLesen } = __m_slicer_24;
-const { MASCHINE_FAEHIGKEIT, WERKSTOFF_ANFORDERUNG, richtwerteErgaenzen, faecherGesamt, faehigkeitText, passtNicht, masseLesen, masseText } = __m_faehigkeiten_38;
+const { MASCHINE_FAEHIGKEIT, WERKSTOFF_ANFORDERUNG, richtwerteErgaenzen, faecherGesamt, faehigkeitText, passtNicht, masseLesen, masseText } = __m_faehigkeiten_39;
 const { aufloesen, kiAbos, kiAboFuer, mengeHier, aufPlatte, STANDARD } = __m_phasen2_22;
-const { kiAuftragsbrief, kiVorschlagEinlesen, kiVorschlagUebernehmen } = __m_ki_39;
-const { angebotHtml, STANDARDHINWEISE_RE, UST_MODI, ANGEBOTSSTATUS, angebotStatus, angebotAbgelaufen } = __m_angebot_25;
-const { schritteAnlegen, schritteAusKalkulation } = __m_schritte_40;
-const { teil2Freigeben, FREIGABEARTEN } = __m_kundenfreigabe_41;
-const { finanzenVon, fixkostenNeu, fixkostenAendern, fixkostenBeenden, fixkostenAktuell, fixkostenSumme, fixkostenImMonat, jahresBetrag, monatsBetrag, gkSatzAusFixkosten, gkSatzNachfuehren, kontoNeu, kontoAbgleichen, kontostaende, buchungNeu, buchungEntfernen, bewegungen, standardKonto, monatsauswertung, zielNeu, zielAuswertung, zielBedarf, offeneForderungen, einkaufOhneAusgabe, liquiditaetsVorschau, bewegungenCsv, finanzKurz, RHYTHMEN, KONTOARTEN, GELDARTEN, KATEGORIEN_EINNAHME, KATEGORIEN_AUSGABE, ZIELARTEN, ANLAGE } = __m_finanzen_27;
+const { kiAuftragsbrief, kiVorschlagEinlesen, kiVorschlagUebernehmen } = __m_ki_40;
+const { angebotHtml, angebotPdf, standardHinweise, UST_MODI, ANGEBOTSSTATUS, angebotStatus, angebotAbgelaufen } = __m_angebot_25;
+const { schritteAnlegen, schritteAusKalkulation } = __m_schritte_41;
+const { teil2Freigeben, FREIGABEARTEN } = __m_kundenfreigabe_42;
+const { finanzenVon, fixkostenNeu, fixkostenAendern, fixkostenBeenden, fixkostenAktuell, fixkostenSumme, fixkostenImMonat, jahresBetrag, monatsBetrag, gkSatzAusFixkosten, gkSatzNachfuehren, kontoNeu, kontoAbgleichen, kontostaende, buchungNeu, buchungEntfernen, bewegungen, standardKonto, monatsauswertung, zielNeu, zielAuswertung, zielBedarf, offeneForderungen, einkaufOhneAusgabe, liquiditaetsVorschau, bewegungenCsv, finanzKurz, RHYTHMEN, KONTOARTEN, GELDARTEN, KATEGORIEN_EINNAHME, KATEGORIEN_AUSGABE, ZIELARTEN, ANLAGE } = __m_finanzen_28;
 const { rechnungsEntwurf, rechnungErstellen, stornieren, zahlungErfassen, rechnungStatus, offen, einnahmenListe, einnahmenCsv, pruefeRechnungen, pflichtangabenFehlen, rechnungNach, statusNachfuehren } = __m_rechnungen_19;
 const { teilNach, teilAnlegen, teilAusKalkulation, revisionAnlegen, dateiVermerken, einmaligErledigt, wiederholKalkulation, teilVerlauf, vorgaenger, hauptkalkulationAktualisieren, ablagePfad, teilNummer, ordnerName, istErledigt, stuecklisteSetzen, stuecklisteKosten, kaufteilePhase, aehnlichBenannt, loeschHindernisse, teilLoeschen, alleTeileLoeschen, istZeitenUebernehmen } = __m_teile_14;
 const { einfrieren, letzterStand, stammVerlaufErgaenzen, vergleicheStaende, preisStamm } = __m_staende_20;
-const { tagesUebersicht } = __m_heute_42;
-const { entwurfHinzufuegen } = __m_entwurf_44;
+const { tagesUebersicht } = __m_heute_43;
+const { entwurfHinzufuegen } = __m_entwurf_45;
 const { kundeAnlegen, kundeNach, kundeUmbenennen, kundenAkte, kundenUebersicht, kundenartVorschlag, kundePflichtFehlt, naechsteKundenNr, kundenNrSetzen, KUNDENFELDER, KUNDENARTEN } = __m_kunden_18;
-const { ordnerLaden, ordnerSpeichern, DATEI } = __m_ablage_ordner_45;
-const { logEintrag, wartungsStatus, plus4Startplan, stundenstand, maschinenIst, LOG_ARTEN, LOG_KOSTENARTEN, AKTE_BEREICHE, AKTE_OEFFENTLICH } = __m_wartung_43;
-const { stundenstandAusTotals, jobsAusHistorie, importiereJobs, istDruck } = __m_moonraker_46;
+const { ordnerLaden, ordnerSpeichern, DATEI } = __m_ablage_ordner_46;
+const { logEintrag, wartungsStatus, plus4Startplan, stundenstand, maschinenIst, LOG_ARTEN, LOG_KOSTENARTEN, AKTE_BEREICHE, AKTE_OEFFENTLICH } = __m_wartung_44;
+const { stundenstandAusTotals, jobsAusHistorie, importiereJobs, istDruck } = __m_moonraker_47;
 const { text: zt, zeit } = __m_zeit_7;
 const { gesetzt, zahl, cent } = __m_runden_2;
-const { tage, saldo, urlaubKonto, istEingestempelt, ANTRAGSARTEN } = __m_zeiterfassung_29;
-const { ROLLEN, darfSpeichern } = __m_rollen_47;
+const { tage, saldo, urlaubKonto, istEingestempelt, ANTRAGSARTEN } = __m_zeiterfassung_30;
+const { ROLLEN, darfSpeichern } = __m_rollen_48;
 const { lagerVon, artikelNach, artikelSpeichern, lieferantSpeichern, buchen, bestand, auftragsBedarf, bestellungAnlegen, bestellungStatus, wareneingang, lagerUebersicht, nachMaschine, planeMitMaterial, ARTIKELARTEN, MASCHINENARTEN, BUCHUNGSARTEN, ZUSTAENDE, GRUPPEN_VORSCHLAG, BESTANDSFILTER, artikelZuCode, materialImLager, lieferzeitVon } = __m_lager_13;
-const { etikettenHtml } = __m_strichcode_50;
+const { etikettenHtml } = __m_strichcode_51;
 const { kreise, naechsteLexwareNr, lexwareNrSetzen, nummernModus, lexwareStart, NUMMERN_MODI, nummernBegonnen, startnummerSetzen, naechsteLieferantenNr } = __m_nummern_15;
 const { VERSANDARTEN_VORSCHLAG } = __m_versand_4;
-const { DOKU_ARTEN, dokuHinzufuegen, aehnlicheSetzen, dokuFuerTeil, teilZuAuftrag } = __m_doku_48;
-const { rueckmeldungen, pruefliste, kiPruefText, istMin } = __m_rueckmeldung_51;
-const { uebersicht } = __m_uebersicht_52;
+const { DOKU_ARTEN, dokuHinzufuegen, aehnlicheSetzen, dokuFuerTeil, teilZuAuftrag } = __m_doku_49;
+const { rueckmeldungen, pruefliste, kiPruefText, istMin } = __m_rueckmeldung_52;
+const { uebersicht } = __m_uebersicht_53;
 const { STANDARD_BEREICHE, bereichVon, bereicheVon, stationenIm, materialStand, auftragsStand, werkstattUebersicht } = __m_werkstatt_11;
-const { codeLesen, codeDeuten } = __m_scanner_53;
+const { codeLesen, codeDeuten } = __m_scanner_54;
 const { gruppe, eintrag, schritteVon, schrittNach } = __m_verzeichnis_10;
-const { delta, anwenden, textMerker } = __m_delta_55;
-const { bedienlast, programmierVorlauf, gemeinsamDrucken } = __m_auslastung_56;
-const { VERKAUFSQUELLEN, verkaufAnlegen, lagerverkauf, lagerauftragAnlegen, lagerauftragEinbuchen, versandSetzen, versandListe, setTeile } = __m_verkauf_49;
-const { MERKMALARTEN, PRUEFORTE, PRUEFARTEN, AUFBEWAHRUNG_JAHRE, haeufigkeitVorschlag, haeufigkeitText, pruefplanSetzen, bewerte, faelligeMerkmale, pruefungErfassen, erstteilFreigeben, erstteilStatus, erstteilGesperrt, planZumAuftrag, pruefprotokolle, pruefplanCsv, messCsvLesen, protokollHtml } = __m_qualitaet_57;
-const { werBin, orgaAktion, orgaKurz, aufgabenFuer, FRISTVORLAGEN, AUFGABENARTEN, RHYTHMEN_AUFGABE, ZIELARTEN: ORGA_ZIELE, NACHWEISE, WOCHENTAGE, TERMINARTEN, BEDARF_KATEGORIEN, BEDARF_FREIGABE_AB, AUSSCHUSSGRUENDE, CAM_FELDER, BEARBEITER, folgeStatus, meldungenFuer, bedarfsliste, offenFuerTeil, termineFuer, brettFuer, warnungen, tagebuch, ZUSTAENDIGKEITEN } = __m_orga_31;
+const { delta, anwenden, textMerker } = __m_delta_56;
+const { bedienlast, programmierVorlauf, gemeinsamDrucken } = __m_auslastung_57;
+const { VERKAUFSQUELLEN, verkaufAnlegen, lagerverkauf, lagerauftragAnlegen, lagerauftragEinbuchen, versandSetzen, versandListe, setTeile } = __m_verkauf_50;
+const { MERKMALARTEN, PRUEFORTE, PRUEFARTEN, AUFBEWAHRUNG_JAHRE, haeufigkeitVorschlag, haeufigkeitText, pruefplanSetzen, bewerte, faelligeMerkmale, pruefungErfassen, erstteilFreigeben, erstteilStatus, erstteilGesperrt, planZumAuftrag, pruefprotokolle, pruefplanCsv, messCsvLesen, protokollHtml } = __m_qualitaet_58;
+const { werBin, orgaAktion, orgaKurz, aufgabenFuer, FRISTVORLAGEN, AUFGABENARTEN, RHYTHMEN_AUFGABE, ZIELARTEN: ORGA_ZIELE, NACHWEISE, WOCHENTAGE, TERMINARTEN, BEDARF_KATEGORIEN, BEDARF_FREIGABE_AB, AUSSCHUSSGRUENDE, CAM_FELDER, BEARBEITER, folgeStatus, meldungenFuer, bedarfsliste, offenFuerTeil, termineFuer, brettFuer, warnungen, tagebuch, ZUSTAENDIGKEITEN } = __m_orga_32;
 
 const SCHLUESSEL = 'belnok-erp-v1';
 const server = { an: false, ich: null, kette: Promise.resolve(), zustand: '', zuletzt: '', zugaenge: null };
@@ -22863,12 +23223,12 @@ function zeigeKalkulation() {
       phasenEditor(k, r),
       teil2Block(k),
       rabattBlock(k, r),
-      h('details', { class: 'mehr-felder', open: !!k.nachfertigungImAngebot },
+      h('details', { class: 'mehr-felder', open: nachbestellAn(k) },
         h('summary', {}, 'Nachfertigungspreis'),
         h('div', { class: 'raster' },
           feld('Nachfertigung: Stückzahl', eingabe(k.nachfertigungMenge, (v) => { k.nachfertigungMenge = v === '' ? '' : zahl(v); render(); }, { inputmode: 'decimal' }),
             'leer = Menge der „je Stück“-Phasen'),
-          feld('Nachfertigungspreis ins Angebot', h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: !!k.nachfertigungImAngebot,
+          feld('Nachbestellpreis ins Angebot', h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: nachbestellAn(k),
             onchange: (e) => { k.nachfertigungImAngebot = e.target.checked; render(); } }), ' ja')))),
       feld('Anmerkung', eingabe(k.anmerkung, (v) => { k.anmerkung = v; render(); })),
       knoepfe(k));
@@ -22943,14 +23303,23 @@ function staendeKarte(k, r) {
       : h('p', { class: 'klein' }, 'Die heutige Rechnung entspricht dem letzten Stand.'));
 }
 
+/** Nachbestellpreis im Angebot: Standard an, sobald es einmalige Phasen gibt (wie im Angebot selbst). */
+const nachbestellAn = (k) => k.nachfertigungImAngebot ?? (k.phasen ?? []).some((p) => p.kostenart === 'einmalig');
+
 function teil2Block(k) {
   if (!k.phasen.some((p) => p.bedingung === 'nach Kundenfreigabe')) return null;
+  // 0.26: Standard ist ein Gesamtpreis; „nach Kundenfreigabe“ heißt nur, die Fertigung wartet auf die Freigabe
+  const stufen = h('div', {}, h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: k.stufenangebot === true, disabled: !!k.teil2Beauftragt,
+    onchange: (e) => { k.stufenangebot = e.target.checked; render(); } }),
+  ' Stufenangebot: Phasen „nach Kundenfreigabe“ mit eigenem Preis, der Kunde beauftragt sie erst nach dem Prototyp'),
+  h('p', { class: 'klein' }, k.stufenangebot === true ? 'Im Angebot: Stufe 1 und Stufe 2 getrennt. Berechnet wird Stufe 2 erst, wenn der Kunde freigegeben hat.'
+    : 'Ein Gesamtpreis. Die Phasen „nach Kundenfreigabe“ sind im Preis enthalten; die Fertigung wartet nur, bis der Kunde freigibt (Freigabe anfordern).'));
   if (k.teil2Beauftragt) {
     const f = k.teil2Freigabe ?? {};
-    return h('p', { class: 'hinweis-ok' }, `Kunde hat freigegeben am ${k.teil2FreigabeAm ?? f.datum ?? '–'}${f.art ? ` per ${f.art}` : ''}${f.person ? ` (${f.person})` : ''}${(f.notiz ?? k.teil2FreigabeNotiz) ? ` · ${f.notiz ?? k.teil2FreigabeNotiz}` : ''}`);
+    return h('div', {}, stufen, h('p', { class: 'hinweis-ok' }, `Kunde hat freigegeben am ${k.teil2FreigabeAm ?? f.datum ?? '–'}${f.art ? ` per ${f.art}` : ''}${f.person ? ` (${f.person})` : ''}${(f.notiz ?? k.teil2FreigabeNotiz) ? ` · ${f.notiz ?? k.teil2FreigabeNotiz}` : ''}`));
   }
   const fr = { datum: heuteText(), art: 'E-Mail', person: '', notiz: '' };
-  return h('div', { class: 'teil2' }, h('h3', {}, 'Kundenfreigabe'),
+  return h('div', { class: 'teil2' }, h('h3', {}, 'Kundenfreigabe'), stufen,
     h('div', { class: 'raster' },
       feld('Freigegeben am', eingabe(fr.datum, (v) => { fr.datum = v; }, { type: 'date' })),
       feld('Wie', auswahl(fr.art, FREIGABEARTEN, (v) => { fr.art = v; }, false)),
@@ -23105,7 +23474,7 @@ function gesamtBlock(r, k) {
   const menge = zahl(k?.menge, 1);
   return h('div', { class: 'gesamt-box' }, h('h3', {}, 'Angebotspreis ganzer Auftrag'),
     h('dl', {},
-      r.optional && freigabe ? [zeile('sofort', eur(sofort)), zeile('nach Kundenfreigabe', eur(freigabe))] : null,
+      r.optional && freigabe ? [zeile('Stufe 1', eur(sofort)), zeile('Stufe 2 (nach Freigabe)', eur(freigabe))] : null,
       zeile('netto', eur(netto), 'summe'),
       zeile(satz ? `MwSt ${pct(satz)}${p.ustModus === 'regel' ? '' : ' (Steuermodus noch offen)'}` : 'MwSt (Kleinunternehmer)', eur(ust)),
       zeile('brutto', eur(cent(netto + ust)), 'summe gross'),
@@ -23121,19 +23490,19 @@ function ergebnisPhasen(r, k) {
   return [
     gesamtBlock(r, k),
     ampelBox(r.ergebnis, r.sofort),
-    r.optional ? h('h3', {}, 'Sofort') : null,
+    r.optional ? h('h3', {}, r.stufenangebot ? 'Stufe 1' : 'Auftrag') : null,
     schema(r.sofort, r, true),
     r.sofort.bewertung && r.preisSofort === null ? zeile('Angebotspreis', badge(r.sofort.bewertung)) : null,
     vergleichswerte(r.sofort),
     h('details', { class: 'mehr-felder' }, h('summary', {}, `Je Phase (${r.phasen.length})`),
       tabelle(['Phase', 'Kostenart', 'Einzelk.', 'Ziel'],
-        r.phasen.map((p) => h('tr', { class: p.entfaellt ? 'leise' : '' }, h('td', {}, `${p.nr}. ${p.name}${p.bedingung === OPTION ? ' (Option)' : p.bedingung !== 'sofort' ? ' (nach Freigabe)' : ''}`), h('td', {}, p.entfaellt ? 'entfällt' : p.kostenart),
+        r.phasen.map((p) => h('tr', { class: p.entfaellt ? 'leise' : '' }, h('td', {}, `${p.nr}. ${p.name}${p.bedingung === OPTION ? ' (Option)' : p.bedingung !== 'sofort' ? ' (Stufe 2)' : p.freigabe ? ' (wartet auf Freigabe)' : ''}`), h('td', {}, p.entfaellt ? 'entfällt' : p.kostenart),
           h('td', { class: 'zahl' }, eur(p.selbstkosten)), h('td', { class: `zahl ${p.zeitGelb ? 'gelb-feld' : ''}` }, eur(p.zielpreis)))))),
     r.nachfertigung ? h('details', { class: 'mehr-felder' }, h('summary', {}, `Nachfertigung (${zahlText(r.nachfertigung.menge)} Stück, ohne einmalige Phasen): ${eur(r.nachfertigung.zielpreis)}`),
       h('dl', {}, zeile('Barausgaben', eur(r.nachfertigung.barausgaben)), zeile('Einzelkosten', eur(r.nachfertigung.selbstkosten)),
         zeile('Mindestpreis', eur(r.nachfertigung.mindestpreis)), zeile('Zielpreis', eur(r.nachfertigung.zielpreis), 'summe'),
         zeile('Zielpreis je Stück', eur(r.nachfertigung.zielpreisStueck)))) : null,
-    r.optional ? [h('h3', {}, optionPhasen(r).length ? 'Nach Kundenfreigabe und Optionen' : 'Nach Kundenfreigabe'), schema(r.optional, r, false)] : null,
+    r.optional ? [h('h3', {}, !r.stufenangebot ? 'Optionen (auf Wunsch)' : optionPhasen(r).length ? 'Stufe 2 (nach Freigabe) und Optionen' : 'Stufe 2 (nach Freigabe)'), schema(r.optional, r, false)] : null,
     r.gesamt.zeitGelb ? h('p', { class: 'gelb-hinweis' }, 'Enthält geschätzte Zeiten (nicht „Zeit gemessen“) oder automatischen Verschleiß (Annahme).') : null,
     r.hinweise.map((t) => h('p', { class: 'warnung' }, t)),
   ];
@@ -23209,7 +23578,7 @@ function angebotKarte(k) {
   k.angebotKunde ??= { name: k.kunde ?? '', ansprechpartner: kd?.ansprechpartner ?? '', anschrift: kd?.anschrift ?? '' };
   const ak = k.angebotKunde;
   k.angebotTermin ??= '';
-  const erzeugen = (neueVersion) => {
+  const erzeugen = async (neueVersion) => {
     const jahr = Number((k.datum ?? heuteText()).slice(0, 4));
     if (!k.angebot) {
       const alle = db.kalkulationen.filter((x) => x.angebot).map((x) => ({ nr: x.angebot.nr }));
@@ -23222,16 +23591,34 @@ function angebotKarte(k) {
     const kennung = `${k.angebot.nr} v${k.angebot.version}`;
     let st = (k.staende ?? []).find((x) => x.angebot === kennung);
     if (!st) st = einfrieren(k, db.stamm, { datum: k.angebot.datum, grund: `Angebot ${kennung}`, angebot: kennung });
-    const html = angebotHtml({ ...st.eingabe, angebot: k.angebot }, { stamm: st.stamm, firma: p.firma, kunde: { ...ak, name: ak.name || k.kunde },
+    const opt = { stamm: st.stamm, firma: p.firma, kunde: { ...ak, name: ak.name || k.kunde },
       nr: k.angebot.nr, version: k.angebot.version, datum: k.angebot.datum, gueltigBis: gueltig,
-      termin: k.angebotTermin, ustModus: p.ustModus ?? 'offen',
-      hinweise: [...(k.phasen.some((x) => x.auftragsart === 'Reverse Engineering') ? STANDARDHINWEISE_RE : []),
-        ...(k.materialFrei?.herkunft === 'beigestellt' ? ['Das Material wird vom Auftraggeber beigestellt.'] : [])] });
-    kalkSpeichern(true);
-    const w = window.open('', '_blank');
-    if (w) { w.document.write(html); w.document.close(); } else herunterladen(`${k.angebot.nr}-v${k.angebot.version}.html`, html, 'text/html');
-    render();
+      termin: k.angebotTermin, ustModus: p.ustModus ?? 'offen', hinweise: standardHinweise(st.eingabe) };
+    // 0.26: PDF aus dem eingefrorenen Stand, in der Ablage beim Kunden gespeichert (Kunden/…/Angebote)
+    const pdf = angebotPdf({ ...st.eingabe, angebot: k.angebot }, opt);
+    const name = `${k.angebot.nr}-v${k.angebot.version}.pdf`;
+    if (!server.an || server.ich?.rolle !== 'Chef') {
+      herunterladen(name, pdf, 'application/pdf');
+      kalkSpeichern(true);
+      meldung(server.an ? 'PDF heruntergeladen (ablegen darf nur der Chef)' : 'PDF heruntergeladen (ohne Server keine Ablage)');
+      return;
+    }
+    const fenster = window.open('', '_blank'); // sofort öffnen, sonst blockt das Handy das Fenster nach dem Hochladen
+    try {
+      const r = await api('POST', '/api/angebot/pdf', { nr: k.angebot.nr, version: k.angebot.version, kunde: ak.name || k.kunde || '', daten: alsBase64(pdf) });
+      k.angebot = { ...k.angebot, pdf: { version: k.angebot.version, pfad: r.pfad, datum: heuteText(), groesse: r.groesse } };
+      kalkSpeichern(true);
+      const ziel = new URL(dateiUrl(r.pfad), location.href).href; // absolut: das leere Fenster hat keine eigene Adresse
+      if (fenster) fenster.location.href = ziel; else window.open(ziel, '_blank');
+      meldung(`${name} gespeichert unter ${r.pfad}`);
+    } catch (e) {
+      fenster?.close();
+      herunterladen(name, pdf, 'application/pdf');
+      kalkSpeichern(true);
+      meldung(`PDF nicht abgelegt (${e.message}), stattdessen heruntergeladen`, true);
+    }
   };
+  const pdfAktuell = k.angebot?.pdf && k.angebot.pdf.version === k.angebot.version ? k.angebot.pdf : null;
   return h('div', { class: 'karte' }, h('h2', {}, 'Angebotsentwurf'),
     h('div', { class: 'raster' },
       feld('Kunde (Firma/Name)', eingabe(ak.name || k.kunde, (v) => { ak.name = v; })),
@@ -23248,10 +23635,56 @@ function angebotKarte(k) {
           } catch (e) { meldung(e.message, true); }
         } }, 'aus Planung berechnen')), 'rechnet mit der heutigen Auslastung und fehlendem Material')),
     h('div', { class: 'knoepfe' },
-      h('button', { class: 'primaer', onclick: () => erzeugen(false) }, k.angebot ? `Angebot ${k.angebot.nr} v${k.angebot.version} öffnen` : 'Angebot erzeugen'),
+      pdfAktuell && server.an
+        ? h('a', { class: 'knopf primaer', href: dateiUrl(pdfAktuell.pfad), target: '_blank' }, `PDF ${k.angebot.nr} v${k.angebot.version} öffnen`)
+        : h('button', { class: 'primaer', onclick: () => erzeugen(false) }, k.angebot ? `PDF ${k.angebot.nr} v${k.angebot.version} erzeugen` : 'Angebot als PDF erzeugen'),
       k.angebot ? h('button', { onclick: () => erzeugen(true) }, 'Neue Version erzeugen') : null),
+    k.angebot ? angebotFreigabe(k, pdfAktuell) : null,
     k.angebot ? angebotVerlauf(k) : null,
-    h('p', { class: 'klein' }, 'Öffnet ein druckbares Dokument (Drucken → Als PDF speichern). Versand an den Kunden nur durch Erik. Solange der Umsatzsteuer-Modus in den Stammdaten „offen“ ist, steht ENTWURF darauf.'));
+    h('p', { class: 'klein' }, 'Das PDF entsteht aus dem eingefrorenen Stand und liegt in der Ablage beim Kunden (Angebote). Erst prüfen, dann freigeben; an den Kunden geht es nur nach deiner Freigabe. Solange der Umsatzsteuer-Modus in den Stammdaten „offen“ ist, steht ENTWURF darauf.'));
+}
+
+/** Uint8Array -> Base64 (in Stücken, damit große Dateien nicht den Stapel sprengen). */
+function alsBase64(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+/** Freigabe und Versand (0.26): Erik prüft das PDF und gibt es frei; danach an den Kunden schicken. */
+function angebotFreigabe(k, pdf) {
+  const st = k.angebot.status ?? 'Entwurf';
+  const kd = kundeNach(db, k.kunde);
+  const an = kd?.email ?? '';
+  const betreff = `Angebot ${k.angebot.nr}${k.teil ? ` – ${k.teil}` : ''}`;
+  const text = `Guten Tag${k.angebotKunde?.ansprechpartner ? ` ${k.angebotKunde.ansprechpartner}` : ''},\n\nanbei erhalten Sie unser Angebot ${k.angebot.nr}. Bei Fragen melden Sie sich gern.\n\nMit freundlichen Grüßen\n${db.stamm.parameter.firma?.inhaber ?? ''}`;
+  const festhalten = (status, notiz) => { angebotStatus(k, status, { datum: heuteText(), notiz }); kalkSpeichern(true); meldung(`Angebot ${k.angebot.nr}: ${status}`); };
+  const senden = async () => {
+    try {
+      const antwort = await fetch(dateiUrl(pdf.pfad));
+      if (!antwort.ok) throw new Error(`PDF nicht lesbar (${antwort.status})`);
+      const datei = new File([await antwort.blob()], `${k.angebot.nr}-v${k.angebot.version}.pdf`, { type: 'application/pdf' });
+      // Handy/Tablet: Teilen-Menü mit PDF (Mail-App); PC: PDF laden und Mail-Entwurf öffnen
+      if (navigator.canShare?.({ files: [datei] })) await navigator.share({ files: [datei], title: betreff, text });
+      else {
+        herunterladen(datei.name, datei, 'application/pdf');
+        location.href = `mailto:${encodeURIComponent(an)}?subject=${encodeURIComponent(betreff)}&body=${encodeURIComponent(`${text}\n\n(PDF anhängen: ${datei.name} aus dem Download-Ordner)`)}`;
+      }
+      if (confirm(`Angebot ${k.angebot.nr} an den Kunden geschickt? Dann als „versendet“ festhalten.`)) festhalten('versendet', an ? `an ${an}` : '');
+    } catch (e) { if (e.name !== 'AbortError') meldung(e.message, true); }
+  };
+  if (!pdf || !server.an) return null;
+  if (st === 'Entwurf') {
+    return h('div', { class: 'reihe' },
+      h('button', { class: 'primaer', onclick: () => { if (confirm(`PDF ${k.angebot.nr} v${k.angebot.version} geprüft und so an den Kunden?`)) festhalten('freigegeben', 'PDF geprüft'); } }, 'Geprüft – freigeben'),
+      h('span', { class: 'klein' }, 'Erst das PDF öffnen und prüfen.'));
+  }
+  if (st === 'freigegeben') {
+    return h('div', { class: 'reihe' },
+      h('button', { class: 'primaer', onclick: senden }, 'An den Kunden schicken'),
+      h('span', { class: 'klein' }, an ? `an ${an}` : 'Keine E-Mail in der Kundenkarte – Empfänger im Mail-Programm eintragen. Später verschickt die KI freigegebene Angebote selbst.'));
+  }
+  return null;
 }
 
 function gueltigBisVon(k) {
