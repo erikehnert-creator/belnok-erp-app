@@ -190,6 +190,7 @@ nav details.mehr > summary.aktiv { background: #F5F5F2; color: var(--graphit); }
 nav details.mehr > summary:hover { border-color: #4a5058; }
 nav .mehr-liste { position: absolute; right: 0; top: calc(100% + 4px); background: var(--graphit); border: 1px solid #4a5058; border-radius: 8px; padding: 6px; display: flex; flex-direction: column; min-width: 190px; z-index: 4; box-shadow: 0 6px 20px rgba(0,0,0,.3); }
 nav .mehr-liste button { text-align: left; }
+nav .mehr-liste { max-width: calc(100vw - 16px); }
 nav button.scan-knopf { border-color: var(--kupfer); color: #fff; background: var(--kupfer); }
 .kamera { position: fixed; inset: 0; background: #000; z-index: 10; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: #fff; }
 .kamera video { max-width: 100%; max-height: 75vh; }
@@ -27126,6 +27127,21 @@ function render() {
   try { renderJetzt(); } finally { zeichnet = false; }
 }
 
+/** Menügruppe: nur eine offen, Liste bleibt im Bildschirm (Handy). */
+function menueAufgeklappt(e) {
+  const d = e.currentTarget ?? e.target;
+  if (!d.open) return;
+  const l = d.querySelector('.mehr-liste');
+  l.style.left = ''; l.style.right = '';
+  const r = l.getBoundingClientRect(), rand = 8, w = document.documentElement.clientWidth, s = d.getBoundingClientRect();
+  if (r.left < rand) { l.style.right = 'auto'; l.style.left = `${Math.min(0, rand - s.left)}px`; }
+  else if (r.right > w - rand) { l.style.left = 'auto'; l.style.right = `${s.right - (w - rand)}px`; }
+}
+// Tipp außerhalb des Menüs, Escape oder eine Wahl schließt die offene Gruppe
+const menueZu = () => document.querySelectorAll('#nav details.mehr[open]').forEach((x) => { x.open = false; });
+document.addEventListener('click', (e) => { if (!e.target.closest?.('#nav details.mehr') || e.target.closest('.mehr-liste button')) menueZu(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') menueZu(); });
+
 function renderJetzt() {
   const nav = document.getElementById('nav');
   const knopf = ([id, name]) => h('button', { class: id === ansicht ? 'aktiv' : '', 'aria-current': id === ansicht ? 'page' : null,
@@ -27135,8 +27151,8 @@ function renderJetzt() {
   nav.replaceChildren(...[...gruppen.map(([titel, l]) => {
     if (l.length === 1) return knopf(l[0]);
     const aktiv = l.find(([id]) => id === ansicht);
-    return h('details', { class: 'mehr' },
-      h('summary', { class: aktiv ? 'aktiv' : '' }, aktiv ? `${titel}: ${aktiv[1]} ▾` : `${titel} ▾`),
+    return h('details', { class: 'mehr', ontoggle: menueAufgeklappt },
+      h('summary', { class: aktiv ? 'aktiv' : '', onclick: (e) => document.querySelectorAll('#nav details.mehr[open]').forEach((x) => { if (x !== e.currentTarget.parentElement) x.open = false; }) }, aktiv ? `${titel}: ${aktiv[1]} ▾` : `${titel} ▾`),
       h('div', { class: 'mehr-liste' }, l.map(knopf)));
   }),
     h('button', { class: 'scan-knopf', title: 'QR-Code scannen (Etikett, Laufzettel)', onclick: kameraScannen }, '⌗ Scannen'),
