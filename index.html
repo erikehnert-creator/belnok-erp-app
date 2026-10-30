@@ -278,7 +278,13 @@ input.grau, input:disabled { background: color-mix(in srgb, var(--linie) 45%, tr
 .artikel-liste { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 6px; }
 .artikel-liste .feld-titel, .feld-voll .feld-titel { color: var(--leise); font-size: 13px; }
 .feld-voll { grid-column: 1 / -1; }
-button.einheit-knopf { font-size: 11px; padding: 0 6px; margin-left: 4px; }
+.einheit-wahl { display: inline-flex; margin-left: 6px; vertical-align: middle; }
+button.einheit-knopf { font-size: 12px; padding: 1px 9px; margin: 0; border-radius: 0; opacity: .6; }
+.einheit-wahl button.einheit-knopf:first-child { border-radius: 6px 0 0 6px; }
+.einheit-wahl button.einheit-knopf:last-child { border-radius: 0 6px 6px 0; border-left: 0; }
+button.einheit-knopf.aktiv { opacity: 1; font-weight: 700; background: var(--blau); color: #fff; }
+small.umrechnung { display: block; opacity: .75; }
+small.umrechnung.achtung { opacity: 1; color: var(--gelb-rand); font-weight: 600; }
 p.ergibt { background: color-mix(in srgb, var(--blau) 7%, transparent); border-radius: 6px; padding: 6px 8px; }
 .gesamt-box { border: 2px solid var(--blau); border-radius: 8px; padding: 6px 12px; margin-bottom: 12px; }
 .gesamt-box h3 { margin: 4px 0; }
@@ -22416,12 +22422,23 @@ function zeitFeld(ph, x, gelb) {
   const einheit = ph.einheiten[x.f] ?? x.einheit ?? 'h';
   const basis = x.basis ? ` · ${BASIS_TEXT[x.basis]}` : '';
   const std = x.standard ? zahl(db.stamm.parameter[x.standard], STANDARD[x.standard]) : null;
-  return h('div', { class: 'feld' }, h('span', {}, `${x.text} (${einheit})${basis} `,
-    h('button', { type: 'button', class: 'einheit-knopf', title: 'Stunden / Minuten umschalten', onclick: () => { ph.einheiten[x.f] = einheit === 'h' ? 'min' : 'h'; render(); } }, einheit === 'h' ? 'in Min' : 'in h')),
+  // 0.25.1: Einheit als zwei Knöpfe „h | min“ (der aktive ist hervorgehoben). Vorher stand auf dem Knopf
+  // „in Min“, das wurde als Einheit gelesen: 30 getippt = 30 Stunden (Rasterbahn, 30.10.2026).
+  const wahl = (u) => h('button', { type: 'button', class: `einheit-knopf${u === einheit ? ' aktiv' : ''}`, 'aria-pressed': String(u === einheit),
+    title: u === 'h' ? 'Eingabe in Stunden' : 'Eingabe in Minuten', onclick: () => { ph.einheiten[x.f] = u; render(); } }, u);
+  const wert = ph.e[x.f];
+  const da = gesetzt(wert) && wert !== '' && zahl(wert) > 0;
+  const stunden = da ? zahl(wert) / 60 : 0;
+  // Zum Gegenlesen immer beide Einheiten; viele Stunden gelb markieren (Minuten gemeint?)
+  const umrechnung = da ? h('small', { class: `umrechnung${einheit === 'h' && stunden >= 8 ? ' achtung' : ''}` },
+    einheit === 'h' ? `= ${zahlKurz(zahl(wert))} min` : `= ${zahlKurz(stunden)} h`,
+    einheit === 'h' && stunden >= 8 ? ` · ${zahlKurz(stunden)} Stunden – Minuten gemeint? Dann „min“ wählen und neu eingeben` : '') : null;
+  return h('div', { class: 'feld' }, h('span', {}, `${x.text}${basis} `,
+    h('span', { class: 'einheit-wahl', role: 'group', 'aria-label': `${x.text} Einheit` }, wahl('h'), wahl('min'))),
   h('input', { value: zeitAnzeige(ph.e[x.f], einheit), inputmode: 'decimal', class: ph.q?.[x.f] && !ph.e.fest?.[x.f] ? '' : gelb,
     placeholder: x.platzhalter ?? (std !== null ? `Standard ${zeitAnzeige(std, einheit)}` : einheit === 'h' ? 'z. B. 1,5 oder 1:30' : ''),
     'aria-label': x.text, onchange: (e) => { try { ph.e[x.f] = zeitLesen(e.target.value, einheit); festSetzen(ph, x.f); } catch (err) { meldung(err.message, true); } render(); } }),
-  quelleHinweis(ph, x.f));
+  umrechnung, quelleHinweis(ph, x.f));
 }
 
 // ---- Kaufteile / Vorrichtungsmaterial aus dem Lager
