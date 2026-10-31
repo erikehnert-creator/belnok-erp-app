@@ -9647,7 +9647,7 @@ function kiAuftragsbrief({ anfrage = '', medien = [], phasen = [], stamm }) {
     `  ${i + 1}. ${ph.name ?? `Phase ${i + 1}`} – Auftragsart „${ph.auftragsart}“, Bedingung „${ph.bedingung ?? 'sofort'}“` +
     `${ph.maschine1 ? `, Maschine 1: ${ph.maschine1}` : ''}${ph.maschine2 ? `, Maschine 2: ${ph.maschine2}` : ''}` +
     `${ph.material ? `, Material: ${ph.material}` : ''}`).join('\n');
-  return `Du unterstützt BELNOK (CAD-Konstruktion, Reverse Engineering, 3D-Druck; CNC-Fertigung nur als Weitergabe an einen Zulieferer) bei der Kalkulation einer Kundenanfrage.
+  return `Du unterstützt BELNOK (CAD-Konstruktion, Reverse Engineering, 3D-Druck, CNC-Fräsen im eigenen Haus; einzelne Schritte auch als Fremdleistung bei Partnern) bei der Kalkulation einer Kundenanfrage.
 
 AUFGABE
 1. Werte die Anfrage und alle beigefügten Fotos, Videos und Sprachnachrichten aus. Fasse zusammen: Teil, Funktion/Einsatzzweck, Menge, Material, Maße und Toleranzen soweit erkennbar, Termin.
@@ -21944,6 +21944,7 @@ async function serverStart() {
   server.an = true;
   server.online = !!status.online;
   server.maxDateiMB = status.maxDateiMB ?? 80;
+  server.ki = !!status.ki;
   server.netz = status.netz ?? [];
   try { server.ich = await api('GET', '/api/ich'); } catch (e) {
     if (e.status === 401) { zeigeAnmeldung(status); return true; }
@@ -23510,22 +23511,77 @@ function ergebnisPhasen(r, k) {
 
 // ---------------------------------------------------------------- KI-Unterstützung
 
+/** Fotos für die KI (nur im Speicher, nicht in der Kalkulation gespeichert). */
+const kiFotos = new Map();
+let kiLaeuft = false;
+
+/** Foto verkleinern (lange Kante max. 1568 px, JPEG): spart Zeit und Kosten, Claude sieht trotzdem alles Wichtige. */
+async function kiFotoVorbereiten(datei) {
+  const url = URL.createObjectURL(datei);
+  try {
+    const img = await new Promise((ok, nein) => { const i = new Image(); i.onload = () => ok(i); i.onerror = () => nein(new Error(`${datei.name} ist kein lesbares Foto`)); i.src = url; });
+    const f = Math.min(1, 1568 / Math.max(img.naturalWidth, img.naturalHeight));
+    const c = document.createElement('canvas');
+    c.width = Math.round(img.naturalWidth * f); c.height = Math.round(img.naturalHeight * f);
+    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+    return { name: datei.name, art: 'image/jpeg', daten: c.toDataURL('image/jpeg', 0.85) };
+  } finally { URL.revokeObjectURL(url); }
+}
+
+async function kiFragenKnopf(k) {
+  const ki = k.ki;
+  const fotos = kiFotos.get(k.nr) ?? [];
+  if (!ki.anfrage?.trim() && !fotos.length) { meldung('Bitte zuerst die Anfrage eintragen oder Fotos anhängen', true); return; }
+  kiLaeuft = true; render();
+  try {
+    const r = await api('POST', '/api/ki/kalkulation', { nr: k.nr, anfrage: ki.anfrage ?? '', medien: ki.medien ?? '', phasen: k.phasen, bilder: fotos });
+    ki.antwort = r.antwort;
+    ki.letzteAnfrage = { datum: heuteText(), modell: r.modell, kostenCent: r.kostenCent, fotos: fotos.length };
+    delete ki.protokoll;
+    kalkSpeichern(true);
+    meldung('Vorschlag von Claude ist da – bitte prüfen');
+  } catch (e) { meldung(e.message, true); }
+  finally { kiLaeuft = false; render(); }
+}
+
 function kiKarte(k) {
   k.ki ??= { anfrage: '', medien: '', antwort: '', variante: 'wahrscheinlich' };
   const ki = k.ki;
   let geprueft = null, fehler = null;
   if (ki.antwort?.trim()) { try { geprueft = kiVorschlagEinlesen(ki.antwort); } catch (e) { fehler = e.message; } }
   const ta = (f, rows, ph) => h('textarea', { rows, placeholder: ph, onchange: (e) => { ki[f] = e.target.value; render(); } }, ki[f] ?? '');
+  const direkt = server.an && server.ki && (istChef() || server.ich?.rolle === 'Meister');
+  const fotos = kiFotos.get(k.nr) ?? [];
+  const fotoWahl = h('input', { type: 'file', accept: 'image/*', multiple: true, 'aria-label': 'Fotos für die KI', onchange: async (e) => {
+    const neu = [...e.target.files];
+    if (fotos.length + neu.length > 6) { meldung('Höchstens 6 Fotos je Anfrage', true); return; }
+    try { kiFotos.set(k.nr, [...fotos, ...(await Promise.all(neu.map(kiFotoVorbereiten)))]); } catch (err) { meldung(err.message, true); }
+    render();
+  } });
+  const letzte = ki.letzteAnfrage;
   return h('div', { class: 'karte' }, h('h2', {}, 'KI-Unterstützung für diese Anfrage'),
-    h('p', { class: 'klein' }, '1. Anfrage und Liste der Kundenmedien eintragen. 2. Auftragsbrief kopieren und zusammen mit Fotos, Videos und Sprachnachrichten an Claude geben. 3. Antwort hier einfügen und prüfen. Die KI schlägt nur vor; übernommene Werte bleiben gelb, bis Ist-Zeiten vorliegen.'),
+    h('p', { class: 'klein' }, direkt
+      ? 'Anfrage eintragen, Fotos anhängen, „KI fragen“. Claude schlägt nur vor: Sie prüfen und übernehmen selbst, übernommene Werte bleiben gelb, bis Ist-Zeiten vorliegen.'
+      : '1. Anfrage und Liste der Kundenmedien eintragen. 2. Auftragsbrief kopieren und zusammen mit Fotos, Videos und Sprachnachrichten an Claude geben. 3. Antwort hier einfügen und prüfen. Die KI schlägt nur vor; übernommene Werte bleiben gelb, bis Ist-Zeiten vorliegen.'),
     h('div', { class: 'zweispaltig' },
       h('div', {}, feld('Anfrage des Kunden (Text, Notizen)', ta('anfrage', 5, 'Was will der Kunde? Menge, Material, Termin, Einsatzzweck …')),
-        feld('Medien (eine Datei pro Zeile)', ta('medien', 3, 'foto_1.jpg\nvideo_halter.mp4\nsprachnachricht_1.ogg')),
+        direkt ? [
+          feld('Fotos (höchstens 6, werden nicht gespeichert)', fotoWahl),
+          fotos.length ? h('ul', { class: 'klein ki-fotos' }, fotos.map((f, i) => h('li', {}, f.name, ' ',
+            h('button', { class: 'klein', 'aria-label': `${f.name} entfernen`, onclick: () => { kiFotos.set(k.nr, fotos.filter((_, j) => j !== i)); render(); } }, '×')))) : null,
+          feld('Weitere Medien (Videos, Sprachnachrichten: nur Namen, eine pro Zeile)', ta('medien', 2, 'video_halter.mp4')),
+          h('button', { class: 'primaer', disabled: kiLaeuft, onclick: () => kiFragenKnopf(k) }, kiLaeuft ? 'Claude denkt nach … (bis zu 2 Minuten)' : 'KI fragen'),
+          h('p', { class: 'klein' }, 'Kostet je Anfrage etwa 5 bis 25 Cent (Anthropic-Konto, Monatslimit dort).'),
+          letzte ? h('p', { class: 'klein' }, `Letzte Anfrage ${deDatum(letzte.datum)}: ${letzte.fotos} Fotos, ca. ${String(letzte.kostenCent).replace('.', ',')} US-Cent`) : null,
+        ] : [
+          feld('Medien (eine Datei pro Zeile)', ta('medien', 3, 'foto_1.jpg\nvideo_halter.mp4\nsprachnachricht_1.ogg')),
+          server.an && !server.ki ? h('p', { class: 'klein' }, 'Direkt fragen geht, sobald der KI-Schlüssel eingerichtet ist („KI-Schlüssel eintragen.cmd“ auf dem PC).') : null,
+        ],
         h('button', { onclick: async () => {
           const brief = kiAuftragsbrief({ anfrage: ki.anfrage, medien: (ki.medien ?? '').split('\n').filter(Boolean), phasen: k.phasen, stamm: db.stamm });
           try { await navigator.clipboard.writeText(brief); meldung('Auftragsbrief kopiert'); } catch { herunterladen(`${k.nr}-ki-auftragsbrief.txt`, brief, 'text/plain'); }
-        } }, 'Auftragsbrief für Claude kopieren')),
-      h('div', {}, feld('Antwort von Claude einfügen', ta('antwort', 8, 'Antwort inklusive ```json …``` Block')),
+        } }, direkt ? 'Oder: Auftragsbrief kopieren' : 'Auftragsbrief für Claude kopieren')),
+      h('div', {}, feld(direkt ? 'Antwort von Claude' : 'Antwort von Claude einfügen', ta('antwort', 8, 'Antwort inklusive ```json …``` Block')),
         fehler ? h('p', { class: 'warnung' }, fehler) : null,
         geprueft ? [
           geprueft.zusammenfassung ? h('p', {}, h('strong', {}, 'Zusammenfassung: '), geprueft.zusammenfassung) : null,
